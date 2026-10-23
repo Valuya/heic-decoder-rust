@@ -9,10 +9,10 @@ fork has no reason to exist.
 
 | Change | Branch | Upstream PR |
 |---|---|---|
-| Skip zero-length NAL units (Nokia `C034.heic` failed to decode) | `fix/skip-zero-length-nal-units` | PR_NAL |
-| Read unlabelled colour as BT.601, as libheif does | `feat/bt601-for-unlabelled-colour` | PR_BT601 |
-| `decode_rgb8_fit`: a downscaled RGB image in bounded memory (24 MB for a 12 MP photo, 20 MB for 200 MP) | `feat/decode-rgb8-fit` | PR_FIT |
-| Branch-free CABAC decision and batched bypass bins (−16 to −26 % cycles, bit-identical) | `perf/branch-free-entropy-decoding` | PR_PERF |
+| Skip zero-length NAL units (Nokia `C034.heic` failed to decode) | `fix/skip-zero-length-nal-units` | [#1](https://github.com/Multipad-cyber/heic-decoder-rust/pull/1) |
+| Read unlabelled colour as BT.601, as libheif does | `feat/bt601-for-unlabelled-colour` | [#2](https://github.com/Multipad-cyber/heic-decoder-rust/pull/2) |
+| `decode_rgb8_fit`: a downscaled RGB image in bounded memory (24 MB for a 12 MP photo, 20 MB for 200 MP) | `feat/decode-rgb8-fit` | [#3](https://github.com/Multipad-cyber/heic-decoder-rust/pull/3) |
+| Branch-free CABAC decision and batched bypass bins (−16 to −26 % cycles, bit-identical) | `perf/branch-free-entropy-decoding` | [#4](https://github.com/Multipad-cyber/heic-decoder-rust/pull/4) |
 
 Each branch is upstream `a1afbf4` plus that change alone, and passes
 `cargo test` and the conformance tests on its own. CI
