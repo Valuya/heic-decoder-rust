@@ -1,5 +1,7 @@
 # heic-decoder
 
+> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request. They fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8_fit` (a downscaled RGB image in bounded memory), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists them with their PRs. The rest of this README is upstream's.
+
 A pure-Rust HEIF/HEIC still-image decoder. Opens the photos your iPhone takes — no C libraries, no `unsafe`, no system codecs.
 
 - **62 of 63** files in the Nokia HEIF conformance suite decode
@@ -112,6 +114,8 @@ tile matches HM.
 | 12 MP grid photos (3), one thread | 319 ms | **264 ms** |
 | 43 Nokia files both decode, all cores | 41.2 ms | **41.1 ms** |
 | 43 Nokia files both decode, one thread | 49.0 ms | **48.0 ms** |
+
+These timings are upstream's, from before this fork's entropy-decoding changes, which cut decode time by 16–26% (see [FORK.md](FORK.md)).
 
 ¹ Sample by sample before colour conversion, from the identical bitstream. heic-rs's samples match heic-decoder's on every primary image in the Nokia suite it decodes. On this crate's 4:2:2 fixtures they differ, while heic-decoder's match HM, the [official HEVC reference decoder](https://vcgit.hhi.fraunhofer.de/jvet/HM).
 
