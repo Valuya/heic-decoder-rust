@@ -1,6 +1,6 @@
 # heic-decoder
 
-> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request. They fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8_fit` (a downscaled RGB image in bounded memory), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists them with their PRs. The rest of this README is upstream's.
+> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request. They fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8` (RGB bit-identical to `decode` + `to_rgb8` at a third of the memory, optionally downscaled), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists them with their PRs. The rest of this README is upstream's.
 
 A pure-Rust HEIF/HEIC still-image decoder. Opens the photos your iPhone takes — no C libraries, no `unsafe`, no system codecs.
 
