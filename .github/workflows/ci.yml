@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: unit and fixture tests
+        run: cargo test --release
+      # The bit-exact checks against HM output need the Nokia conformance files.
+      - name: conformance files
+        run: git clone --depth 1 https://github.com/nokiatech/heif_conformance "$RUNNER_TEMP/heif_conformance"
+      - name: conformance tests
+        run: cargo test --release -- --ignored
+        env:
+          HEIF_CONFORMANCE_DIR: ${{ runner.temp }}/heif_conformance/conformance_files
