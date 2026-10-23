@@ -1,6 +1,6 @@
 # heic-decoder
 
-> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request. They fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8_fit` (a downscaled RGB image in bounded memory), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists them with their PRs. The rest of this README is upstream's.
+> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request. They fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8` (RGB bit-identical to `decode` + `to_rgb8` at a third of the memory, optionally downscaled), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists them with their PRs. The rest of this README is upstream's.
 
 A pure-Rust HEIF/HEIC still-image decoder. Opens the photos your iPhone takes — no C libraries, no `unsafe`, no system codecs.
 
@@ -17,11 +17,18 @@ heic-decoder = "0.1"
 
 ```rust
 let data = std::fs::read("photo.heic")?;
+// Most callers want RGB: this decodes straight to it, without holding
+// the planar picture (53 MB instead of 150 MB for a 12 MP iPhone photo).
+let rgb = heic_decoder::decode_rgb8(&data)?; // rgb.data holds u8 RGB triples
+// A smaller copy in bounded memory (35 MB for that photo, ~50 MB for 200 MP):
+let small = heic_decoder::decode_rgb8_with(&data, &heic_decoder::DecodeRgbOptions { max_edge: Some(1568), ..Default::default() })?;
+
+// The planar samples, at their coded bit depth:
 let image = heic_decoder::decode(&data)?;
 println!("{}×{}, {}-bit", image.width, image.height, image.bit_depth_luma);
 // image.y / image.cb / image.cr hold the planar samples
 
-// Optional: convert only when your caller needs RGB.
+// Converted from those, at higher depth or with alpha:
 let rgb = image.to_rgb16()?; // rgb.data holds u16 RGB triples, 0..=65535
 // image.to_rgb8()?.data holds u8 RGB triples instead.
 // Preserve transparency when needed:
@@ -63,6 +70,25 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 - Safe on untrusted input: malformed files return an error instead of crashing, and pictures above 268 megapixels (`MAX_IMAGE_PIXELS`) are refused before anything is allocated
 
 `decode` returns monochrome or planar YCbCr at the coded bit depth, with an optional native alpha plane. It does no RGB conversion. Rotation preserves native chroma samples: rotated 4:2:2 can have full-width, half-height chroma, so use `cb_width` and `cb_height` for output plane dimensions. The `decode_file` example writes samples above 8 bits as little-endian `u16`.
+
+## Decoding straight to RGB
+
+`decode_rgb8(&data)` returns the same pixels as `decode(&data)?.to_rgb8()`, bit for bit, without assembling the planar picture. A grid is decoded one row of tiles at a time. Each source row is converted as soon as the chroma rows it reads have been decoded, and is then released. The container's crop, rotation and mirroring are resolved into index maps with the chroma geometry `decode` would produce, so every pixel goes through the planar converter's arithmetic. Peak memory, one core:
+
+| photo | `decode` + `to_rgb8` | `decode_rgb8` | `decode_rgb8_with`, `max_edge: Some(1568)` |
+|---|---|---|---|
+| iPhone 12 MP grid | 151 MB | 53 MB (36 MB of it the output) | 35 MB |
+| 48 MP grid | 582 MB | 193 MB | 66 MB |
+| 200 MP grid | 3.4 GB | 608 MB | 49 MB |
+
+`decode_rgb8_with(&data, &DecodeRgbOptions { .. })` adds options:
+
+- `max_edge`: scale the longest edge down to at most this size, by averaging the full-size pixels that fall in each output pixel. Only the output is held.
+- `alpha`: `AlphaMode::Ignore` (the default, as `to_rgb8` does; the alpha image is then not decoded at all) or `AlphaMode::Over([r, g, b])`, which composites over a background using alpha as `to_rgba8` scales it.
+- `rgb`: the same `RgbOptions` as `to_rgb8_with_options`.
+- `max_picture_pixels`, `max_total_pixels`: limits on every coded picture, at its uncropped SPS size, and on a grid's canvas and the sum of its tiles. They are checked before anything is allocated, because a failed allocation aborts the process.
+
+The time is within a few percent of `decode` + `to_rgb8`. A file that doesn't stream (a predicted image, a grid with uneven or odd-sized tiles) goes through `decode` instead, under the same limits and with the same result. `tests/rgb_decode.rs` checks the equality on every bundled fixture, and on every Nokia conformance file with `--ignored`.
 
 ## Optional RGB conversion
 
