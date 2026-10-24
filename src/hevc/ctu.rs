@@ -22,17 +22,119 @@ use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
 use crate::timing::{self, Stage};
 
+/// A plane's samples: bytes for an 8-bit plane, `u16` for a deeper one (bit
+/// depths are at most 16). The decoder clips every value to `0 ..=
+/// (1 << bit_depth) - 1` before storing it, so narrowing loses nothing;
+/// prediction, the transforms and the loop filters still compute in `i32`.
+pub(crate) enum Samples {
+    Narrow(Vec<u8>),
+    Wide(Vec<u16>),
+}
+
+/// A stored sample: `u8` or `u16`.
+pub(crate) trait Sample: Copy + Default + Into<i32> {
+    /// `value`, already clipped to the plane's bit depth, narrowed.
+    fn narrow(value: i32) -> Self;
+}
+
+impl Sample for u8 {
+    #[inline(always)]
+    fn narrow(value: i32) -> Self {
+        value as u8
+    }
+}
+
+impl Sample for u16 {
+    #[inline(always)]
+    fn narrow(value: i32) -> Self {
+        value as u16
+    }
+}
+
+impl Samples {
+    /// `len` zeros, narrow when `bit_depth` fits a byte, reusing the buffer.
+    fn reset(&mut self, bit_depth: u32, len: usize) {
+        match self {
+            Samples::Narrow(samples) if bit_depth <= 8 => {
+                samples.clear();
+                samples.resize(len, 0);
+            }
+            Samples::Wide(samples) if bit_depth > 8 => {
+                samples.clear();
+                samples.resize(len, 0);
+            }
+            _ => *self = if bit_depth <= 8 { Samples::Narrow(vec![0; len]) } else { Samples::Wide(vec![0; len]) },
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, index: usize) -> Option<i32> {
+        match self {
+            Samples::Narrow(samples) => samples.get(index).map(|&s| s.into()),
+            Samples::Wide(samples) => samples.get(index).map(|&s| s.into()),
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, index: usize, value: i32) -> Option<()> {
+        match self {
+            Samples::Narrow(samples) => *samples.get_mut(index)? = u8::narrow(value),
+            Samples::Wide(samples) => *samples.get_mut(index)? = u16::narrow(value),
+        }
+        Some(())
+    }
+
+    /// Appends samples `range`, widened to `i32`, to `out`; `None` past the end.
+    fn widen_into(&self, range: std::ops::Range<usize>, out: &mut Vec<i32>) -> Option<()> {
+        match self {
+            Samples::Narrow(samples) => out.extend(samples.get(range)?.iter().map(|&s| i32::from(s))),
+            Samples::Wide(samples) => out.extend(samples.get(range)?.iter().map(|&s| i32::from(s))),
+        }
+        Some(())
+    }
+}
+
+/// One colour component of a picture, `width x height` samples.
 pub struct Plane {
     pub width: usize,
     pub height: usize,
     pub bit_depth: u32,
-    samples: Vec<i32>,
-    decoded: Vec<bool>,
+    samples: Samples,
+    /// One bit per sample, row-major: set once the CTU decode driver has
+    /// written it.
+    decoded: Vec<u64>,
+}
+
+/// Sets bits `start..start + len`, all inside `bits`.
+fn mark_decoded(bits: &mut [u64], start: usize, len: usize) {
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        let (word, bit) = (at / 64, at % 64);
+        let take = (64 - bit).min(end - at);
+        let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
+        if let Some(w) = bits.get_mut(word) {
+            *w |= mask;
+        }
+        at += take;
+    }
 }
 
 impl Plane {
-    fn new(width: usize, height: usize, bit_depth: u32) -> Self {
-        Plane { width, height, bit_depth, samples: vec![0; width * height], decoded: vec![false; width * height] }
+    fn empty() -> Self {
+        Plane { width: 0, height: 0, bit_depth: 8, samples: Samples::Narrow(Vec::new()), decoded: Vec::new() }
+    }
+
+    /// `width x height` zeros, none decoded, keeping the buffers.
+    fn reset(&mut self, width: usize, height: usize, bit_depth: u32) {
+        (self.width, self.height, self.bit_depth) = (width, height, bit_depth);
+        self.samples.reset(bit_depth, width * height);
+        self.decoded.clear();
+        self.decoded.resize((width * height).div_ceil(64), 0);
+    }
+
+    fn is_decoded(&self, index: usize) -> bool {
+        self.decoded.get(index / 64).is_some_and(|word| word >> (index % 64) & 1 != 0)
     }
 
     fn get(&self, x: i64, y: i64) -> Option<i32> {
@@ -40,7 +142,7 @@ impl Plane {
             return None;
         }
         let idx = y as usize * self.width + x as usize;
-        if *self.decoded.get(idx)? { self.samples.get(idx).copied() } else { None }
+        if self.is_decoded(idx) { self.samples.get(idx) } else { None }
     }
 
     /// Post-reconstruction passes (deblocking, SAO) only ever run after
@@ -52,7 +154,7 @@ impl Plane {
         if x >= self.width || y >= self.height {
             return None;
         }
-        self.samples.get(y * self.width + x).copied()
+        self.samples.get(y * self.width + x)
     }
 
     #[cfg(test)]
@@ -60,15 +162,10 @@ impl Plane {
         if x >= self.width || y >= self.height {
             return None;
         }
-        *self.samples.get_mut(y * self.width + x)? = v;
-        Some(())
+        self.samples.set(y * self.width + x, v)
     }
 
-    pub(crate) fn samples(&self) -> &[i32] {
-        &self.samples
-    }
-
-    pub(crate) fn samples_mut(&mut self) -> &mut [i32] {
+    pub(crate) fn samples_mut(&mut self) -> &mut Samples {
         &mut self.samples
     }
 
@@ -77,13 +174,13 @@ impl Plane {
             return Err(HeifError::MalformedHevc("plane write out of bounds"));
         }
         let idx = y * self.width + x;
-        *self.samples.get_mut(idx).ok_or(HeifError::MalformedHevc("plane write out of bounds"))? = v;
-        *self.decoded.get_mut(idx).ok_or(HeifError::MalformedHevc("plane write out of bounds"))? = true;
+        self.samples.set(idx, v).ok_or(HeifError::MalformedHevc("plane write out of bounds"))?;
+        mark_decoded(&mut self.decoded, idx, 1);
         Ok(())
     }
 
     /// Writes an `n x n` block, row-major in `block`, at `(x0, y0)` and marks
-    /// it decoded.
+    /// it decoded. The values are clipped to the bit depth already.
     fn write_block(&mut self, x0: usize, y0: usize, n: usize, block: &[i32]) -> Result<()> {
         let out_of_bounds = || HeifError::MalformedHevc("plane write out of bounds");
         if x0 + n > self.width || y0 + n > self.height || block.len() < n * n {
@@ -91,14 +188,23 @@ impl Plane {
         }
         for (row, source) in block.chunks_exact(n).enumerate() {
             let start = (y0 + row) * self.width + x0;
-            self.samples.get_mut(start..start + n).ok_or_else(out_of_bounds)?.copy_from_slice(source);
-            self.decoded.get_mut(start..start + n).ok_or_else(out_of_bounds)?.fill(true);
+            match &mut self.samples {
+                Samples::Narrow(samples) => {
+                    samples.get_mut(start..start + n).ok_or_else(out_of_bounds)?.iter_mut().zip(source).for_each(|(d, &s)| *d = u8::narrow(s))
+                }
+                Samples::Wide(samples) => {
+                    samples.get_mut(start..start + n).ok_or_else(out_of_bounds)?.iter_mut().zip(source).for_each(|(d, &s)| *d = u16::narrow(s))
+                }
+            }
+            mark_decoded(&mut self.decoded, start, n);
         }
         Ok(())
     }
 
     pub fn into_samples(self) -> Vec<i32> {
-        self.samples
+        let mut out = Vec::with_capacity(self.width * self.height);
+        self.samples.widen_into(0..self.width * self.height, &mut out);
+        out
     }
 }
 
@@ -113,11 +219,54 @@ pub(crate) struct SaoCtbParams {
     pub offsets: [[i32; 4]; 3],
 }
 
+/// Scratch rows for `hevc::sao`, kept with the picture so they are reused.
+#[derive(Default)]
+pub(crate) struct SaoRows {
+    pub narrow: Vec<u8>,
+    pub wide: Vec<u16>,
+}
+
+/// `Picture::flags` bits, one byte per 4x4 min-PU.
+const SKIP: u8 = 1;
+const RESIDUAL: u8 = 1 << 1;
+const BYPASS: u8 = 1 << 2;
+const CU_EDGE_LEFT: u8 = 1 << 3;
+const CU_EDGE_TOP: u8 = 1 << 4;
+const TU_EDGE_LEFT: u8 = 1 << 5;
+const TU_EDGE_TOP: u8 = 1 << 6;
+
+fn min_pu_index(min_pu_width: usize, min_pu_height: usize, x: i64, y: i64) -> Option<usize> {
+    if x < 0 || y < 0 || (x as usize) >= min_pu_width * 4 || (y as usize) >= min_pu_height * 4 {
+        return None;
+    }
+    Some((y as usize / 4) * min_pu_width + (x as usize / 4))
+}
+
+/// Which min-PUs are coded with transquant bypass, read while a plane is
+/// borrowed mutably.
+pub(crate) struct BypassMap<'a> {
+    flags: &'a [u8],
+    min_pu_width: usize,
+    min_pu_height: usize,
+}
+
+impl BypassMap<'_> {
+    /// Whether the luma position `(x, y)` is in a bypass-coded CU.
+    pub(crate) fn at(&self, x: i64, y: i64) -> bool {
+        min_pu_index(self.min_pu_width, self.min_pu_height, x, y).and_then(|i| self.flags.get(i)).is_some_and(|&f| f & BYPASS != 0)
+    }
+}
+
+/// A decoded picture and the per-block state its decode and loop filters
+/// read. Its buffers are kept across [`Picture::reset`], so one `Picture`
+/// can decode tile after tile without allocating again.
 pub struct Picture {
+    /// Motion per min-PU, raster order; empty until the first inter PU.
     motions: Vec<Option<Motion>>,
-    skips: Vec<bool>,
-    luma_residual: Vec<bool>,
-    bypass: Vec<bool>,
+    /// Per min-PU: skipped, has a coded luma residual, transquant bypass,
+    /// and whether it is on its CU's / luma TU's left or top edge (the
+    /// `SKIP` .. `TU_EDGE_TOP` bits).
+    flags: Vec<u8>,
     pub y: Plane,
     pub cb: Plane,
     pub cr: Plane,
@@ -131,21 +280,15 @@ pub struct Picture {
     ct_depth: Vec<u8>,
     min_cb_log2: u32,
     min_cb_width: usize,
-    /// Deblocking bookkeeping, all at the same 4x4 min-PU granularity as
-    /// `intra_mode`: the reconstructed `QpY` each position's CU used,
-    /// whether that position is a CU's/luma TU's own left/top edge, and
-    /// Populated by `Decoder::coding_unit`/`transform_unit`, read only by
+    /// Deblocking bookkeeping, at the same 4x4 min-PU granularity as
+    /// `intra_mode`: the reconstructed `QpY` each position's CU used.
+    /// The CU/TU edge flags beside it in `flags` are populated by
+    /// `Decoder::coding_unit`/`transform_unit` and read only by
     /// `hevc::deblock` (clause 8.7.2.4's boundary-strength derivation,
     /// which is unconditionally `bS == 2` at any CU *or* transform-block
-    /// edge for this decoder's intra-only scope: that clause's "either
-    /// side is intra" branch always fires first, so the `cbf`-dependent
-    /// `bS == 1` branch — relevant only to inter blocks — is never
-    /// reached and isn't tracked here).
+    /// edge for intra blocks: that clause's "either side is intra"
+    /// branch always fires first).
     qp_y: Vec<i8>,
-    cu_edge_left: Vec<bool>,
-    cu_edge_top: Vec<bool>,
-    tu_edge_left: Vec<bool>,
-    tu_edge_top: Vec<bool>,
     /// Parsed per-CTB SAO parameters, populated by `Decoder::decode_sao`
     /// and read only by `hevc::sao`.
     sao: Vec<SaoCtbParams>,
@@ -153,11 +296,56 @@ pub struct Picture {
     pic_width_ctbs: usize,
     pic_height_ctbs: usize,
     slice_start_y: usize,
+    /// Unfiltered rows `hevc::sao` reads while it filters a plane in place,
+    /// for 8-bit and for deeper planes.
+    sao_rows: SaoRows,
 }
 
 impl Picture {
     #[allow(clippy::too_many_arguments)]
     pub fn new(width: usize, height: usize, sub_w: usize, sub_h: usize, bit_depth_luma: u32, bit_depth_chroma: u32, min_cb_log2: u32, ctb_log2: u32) -> Self {
+        let mut pic = Picture::empty();
+        pic.reset(width, height, sub_w, sub_h, bit_depth_luma, bit_depth_chroma, min_cb_log2, ctb_log2);
+        pic
+    }
+
+    /// A zero-sized picture, to [`reset`](Self::reset) before use.
+    pub(crate) fn empty() -> Self {
+        Picture {
+            motions: Vec::new(),
+            flags: Vec::new(),
+            y: Plane::empty(),
+            cb: Plane::empty(),
+            cr: Plane::empty(),
+            intra_mode: Vec::new(),
+            min_pu_width: 0,
+            min_pu_height: 0,
+            ct_depth: Vec::new(),
+            min_cb_log2: 0,
+            min_cb_width: 0,
+            qp_y: Vec::new(),
+            sao: Vec::new(),
+            ctb_log2: 0,
+            pic_width_ctbs: 0,
+            pic_height_ctbs: 0,
+            slice_start_y: 0,
+            sao_rows: SaoRows::default(),
+        }
+    }
+
+    /// The state [`Picture::new`] gives, in this picture's buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reset(
+        &mut self,
+        width: usize,
+        height: usize,
+        sub_w: usize,
+        sub_h: usize,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+        min_cb_log2: u32,
+        ctb_log2: u32,
+    ) {
         let cw = if sub_w == 0 { 0 } else { width.div_ceil(sub_w) };
         let ch = if sub_h == 0 { 0 } else { height.div_ceil(sub_h) };
         let min_pu_width = width.div_ceil(4);
@@ -167,86 +355,99 @@ impl Picture {
         let pic_width_ctbs = width.div_ceil(1 << ctb_log2);
         let pic_height_ctbs = height.div_ceil(1 << ctb_log2);
         let min_pu_count = min_pu_width * min_pu_height;
-        Picture {
-            slice_start_y: 0,
-            motions: vec![None; min_pu_count],
-            skips: vec![false; min_pu_count],
-            luma_residual: vec![false; min_pu_count],
-            bypass: vec![false; min_pu_count],
-            y: Plane::new(width, height, bit_depth_luma),
-            cb: Plane::new(cw, ch, bit_depth_chroma),
-            cr: Plane::new(cw, ch, bit_depth_chroma),
-            intra_mode: vec![1; min_pu_count], // INTRA_DC default
-            min_pu_width,
-            min_pu_height,
-            ct_depth: vec![0; min_cb_width * min_cb_height],
-            min_cb_log2,
-            min_cb_width,
-            qp_y: vec![0; min_pu_count],
-            cu_edge_left: vec![false; min_pu_count],
-            cu_edge_top: vec![false; min_pu_count],
-            tu_edge_left: vec![false; min_pu_count],
-            tu_edge_top: vec![false; min_pu_count],
-            sao: vec![SaoCtbParams::default(); pic_width_ctbs * pic_height_ctbs],
-            ctb_log2,
-            pic_width_ctbs,
-            pic_height_ctbs,
+        let refill = |v: &mut Vec<u8>, len: usize, value: u8| {
+            v.clear();
+            v.resize(len, value);
+        };
+        self.slice_start_y = 0;
+        self.motions.clear();
+        refill(&mut self.flags, min_pu_count, 0);
+        self.y.reset(width, height, bit_depth_luma);
+        self.cb.reset(cw, ch, bit_depth_chroma);
+        self.cr.reset(cw, ch, bit_depth_chroma);
+        refill(&mut self.intra_mode, min_pu_count, 1); // INTRA_DC default
+        self.min_pu_width = min_pu_width;
+        self.min_pu_height = min_pu_height;
+        refill(&mut self.ct_depth, min_cb_width * min_cb_height, 0);
+        self.min_cb_log2 = min_cb_log2;
+        self.min_cb_width = min_cb_width;
+        self.qp_y.clear();
+        self.qp_y.resize(min_pu_count, 0);
+        self.sao.clear();
+        self.sao.resize(pic_width_ctbs * pic_height_ctbs, SaoCtbParams::default());
+        self.ctb_log2 = ctb_log2;
+        self.pic_width_ctbs = pic_width_ctbs;
+        self.pic_height_ctbs = pic_height_ctbs;
+    }
+
+    fn flag_at(&self, x: i64, y: i64, flag: u8) -> Option<bool> {
+        self.min_pu_index(x, y).and_then(|i| self.flags.get(i)).map(|&f| f & flag != 0)
+    }
+
+    /// Sets or clears `flag` of min-PU `index`, if it exists.
+    fn set_flag(&mut self, index: usize, flag: u8, value: bool) {
+        if let Some(f) = self.flags.get_mut(index) {
+            if value {
+                *f |= flag;
+            } else {
+                *f &= !flag;
+            }
         }
     }
 
+    pub(crate) fn bypass_map(&self) -> BypassMap<'_> {
+        BypassMap { flags: &self.flags, min_pu_width: self.min_pu_width, min_pu_height: self.min_pu_height }
+    }
+
     pub(crate) fn bypass_at(&self, x: i64, y: i64) -> bool {
-        self.min_pu_index(x, y).and_then(|i| self.bypass.get(i)).copied().unwrap_or(false)
+        self.bypass_map().at(x, y)
     }
     pub(crate) fn mark_bypass(&mut self, x: usize, y: usize, size: usize, value: bool) {
         for row in (y..(y + size).min(self.y.height)).step_by(4) {
             for col in (x..(x + size).min(self.y.width)).step_by(4) {
                 if let Some(i) = self.min_pu_index(col as i64, row as i64) {
-                    self.bypass[i] = value;
+                    self.set_flag(i, BYPASS, value);
                 }
             }
         }
     }
     pub(crate) fn has_bypass(&self) -> bool {
-        self.bypass.iter().any(|&b| b)
+        self.flags.iter().any(|&f| f & BYPASS != 0)
     }
-    /// SAO reads the original raster; restore protected samples after its pass.
-    pub(crate) fn restore_bypass(&mut self, cidx: usize, snapshot: &[i32], sub_w: usize, sub_h: usize) {
-        let width = match cidx {
-            0 => self.y.width,
-            1 => self.cb.width,
-            _ => self.cr.width,
+
+    /// Plane `cidx`, the rows buffer SAO filters it with, and the bypass map,
+    /// borrowed together.
+    pub(crate) fn sao_parts(&mut self, cidx: usize) -> (&mut Plane, &mut SaoRows, BypassMap<'_>) {
+        let plane = match cidx {
+            0 => &mut self.y,
+            1 => &mut self.cb,
+            _ => &mut self.cr,
         };
-        for (i, &sample) in snapshot.iter().enumerate() {
-            if self.bypass_at(((i % width) * sub_w) as i64, ((i / width) * sub_h) as i64) {
-                let plane = match cidx {
-                    0 => &mut self.y,
-                    1 => &mut self.cb,
-                    _ => &mut self.cr,
-                };
-                if let Some(out) = plane.samples_mut().get_mut(i) {
-                    *out = sample;
-                }
-            }
-        }
+        (plane, &mut self.sao_rows, BypassMap { flags: &self.flags, min_pu_width: self.min_pu_width, min_pu_height: self.min_pu_height })
     }
 
     fn motion_at(&self, x: i64, y: i64) -> Option<Motion> {
         self.min_pu_index(x, y).and_then(|i| self.motions.get(i).copied().flatten())
     }
     fn skip_at(&self, x: i64, y: i64) -> bool {
-        self.min_pu_index(x, y).and_then(|i| self.skips.get(i)).copied().unwrap_or(false)
+        self.flag_at(x, y, SKIP).unwrap_or(false)
     }
     fn mark_motion(&mut self, x: usize, y: usize, w: usize, h: usize, mv: Motion, skip: bool) {
+        if self.motions.is_empty() {
+            self.motions.resize(self.flags.len(), None);
+        }
         for row in (y..y + h).step_by(4) {
             for col in (x..x + w).step_by(4) {
                 if let Some(i) = self.min_pu_index(col as i64, row as i64) {
-                    self.motions[i] = Some(mv);
-                    self.skips[i] = skip;
+                    if let Some(m) = self.motions.get_mut(i) {
+                        *m = Some(mv);
+                    }
+                    self.set_flag(i, SKIP, skip);
                     if col == x {
-                        self.cu_edge_left[i] = true;
+                        self.set_flag(i, CU_EDGE_LEFT, true);
                     }
                     if row == y {
-                        self.cu_edge_top[i] = true;
+                        self.set_flag(i, CU_EDGE_TOP, true);
                     }
                 }
             }
@@ -256,7 +457,7 @@ impl Picture {
         for row in (y..y + size).step_by(4) {
             for col in (x..x + size).step_by(4) {
                 if let Some(i) = self.min_pu_index(col as i64, row as i64) {
-                    self.luma_residual[i] = coded;
+                    self.set_flag(i, RESIDUAL, coded);
                 }
             }
         }
@@ -267,7 +468,7 @@ impl Picture {
             return 2;
         };
         let tu = if vertical { self.is_tu_edge_left(x, y) } else { self.is_tu_edge_top(x, y) }.unwrap_or(false);
-        let coded = |xx, yy| self.min_pu_index(xx, yy).map(|i| self.luma_residual[i]).unwrap_or(false);
+        let coded = |xx, yy| self.flag_at(xx, yy, RESIDUAL).unwrap_or(false);
         if tu && (coded(px, py) || coded(x, y)) || (a.x - b.x).abs() >= 4 || (a.y - b.y).abs() >= 4 { 1 } else { 0 }
     }
 
@@ -275,31 +476,21 @@ impl Picture {
     /// column is a CU boundary (`bS == 2` candidate) for every row it
     /// spans, likewise its top row for every column.
     pub(crate) fn mark_cu_edges(&mut self, x0: usize, y0: usize, size: usize) {
-        let (x_pu, y_pu, n) = (x0 / 4, y0 / 4, (size / 4).max(1));
-        for dy in 0..n {
-            if let Some(f) = self.cu_edge_left.get_mut((y_pu + dy) * self.min_pu_width + x_pu) {
-                *f = true;
-            }
-        }
-        for dx in 0..n {
-            if let Some(f) = self.cu_edge_top.get_mut(y_pu * self.min_pu_width + (x_pu + dx)) {
-                *f = true;
-            }
-        }
+        self.mark_edges(x0, y0, size, CU_EDGE_LEFT, CU_EDGE_TOP);
     }
 
     /// Same as `mark_cu_edges` but for a leaf luma transform block.
     pub(crate) fn mark_tu_edges(&mut self, x0: usize, y0: usize, size: usize) {
+        self.mark_edges(x0, y0, size, TU_EDGE_LEFT, TU_EDGE_TOP);
+    }
+
+    fn mark_edges(&mut self, x0: usize, y0: usize, size: usize, left: u8, top: u8) {
         let (x_pu, y_pu, n) = (x0 / 4, y0 / 4, (size / 4).max(1));
         for dy in 0..n {
-            if let Some(f) = self.tu_edge_left.get_mut((y_pu + dy) * self.min_pu_width + x_pu) {
-                *f = true;
-            }
+            self.set_flag((y_pu + dy) * self.min_pu_width + x_pu, left, true);
         }
         for dx in 0..n {
-            if let Some(f) = self.tu_edge_top.get_mut(y_pu * self.min_pu_width + (x_pu + dx)) {
-                *f = true;
-            }
+            self.set_flag(y_pu * self.min_pu_width + (x_pu + dx), top, true);
         }
     }
 
@@ -316,10 +507,7 @@ impl Picture {
     }
 
     fn min_pu_index(&self, x: i64, y: i64) -> Option<usize> {
-        if x < 0 || y < 0 || (x as usize) >= self.min_pu_width * 4 || (y as usize) >= self.min_pu_height * 4 {
-            return None;
-        }
-        Some((y as usize / 4) * self.min_pu_width + (x as usize / 4))
+        min_pu_index(self.min_pu_width, self.min_pu_height, x, y)
     }
 
     pub(crate) fn qp_y_at(&self, x: i64, y: i64) -> Option<i32> {
@@ -330,19 +518,19 @@ impl Picture {
     }
 
     pub(crate) fn is_cu_edge_left(&self, x: i64, y: i64) -> Option<bool> {
-        self.min_pu_index(x, y).and_then(|i| self.cu_edge_left.get(i)).copied()
+        self.flag_at(x, y, CU_EDGE_LEFT)
     }
 
     pub(crate) fn is_cu_edge_top(&self, x: i64, y: i64) -> Option<bool> {
-        self.min_pu_index(x, y).and_then(|i| self.cu_edge_top.get(i)).copied()
+        self.flag_at(x, y, CU_EDGE_TOP)
     }
 
     pub(crate) fn is_tu_edge_left(&self, x: i64, y: i64) -> Option<bool> {
-        self.min_pu_index(x, y).and_then(|i| self.tu_edge_left.get(i)).copied()
+        self.flag_at(x, y, TU_EDGE_LEFT)
     }
 
     pub(crate) fn is_tu_edge_top(&self, x: i64, y: i64) -> Option<bool> {
-        self.min_pu_index(x, y).and_then(|i| self.tu_edge_top.get(i)).copied()
+        self.flag_at(x, y, TU_EDGE_TOP)
     }
 
     pub(crate) fn width(&self) -> usize {
