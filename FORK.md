@@ -20,6 +20,7 @@ fork has no reason to exist.
 | Deblocking filters a segment's four lines at once, rows read as slices (−1.2 % cycles) | `perf/deblock-lanes` | not yet offered; built on this fork's `main` |
 | `decode_rgb8`: a rotated picture's output rows gathered with one loop each (−7.9 % cycles on rotated iPhone photos) | `perf/turned-scatter` | not yet offered; built on this fork's `main` |
 | Intra prediction row by row, border read once (−1.7 % cycles) | `perf/intra-rows` | not yet offered; built on this fork's `main` |
+| `decode_rgb8`: each chroma row interpolated once per run of output rows, `DecodeRgbOptions::reuse_chroma_rows` (on by default; −8.9 % cycles on upright photos, no change on rotated ones) | `perf/rgb-rows` | not yet offered; built on this fork's `main` |
 
 Cycle figures: one thread on a P-core, the 10 sample photos, `perf stat`
 in pairs of alternating order against the `main` before the change; every
