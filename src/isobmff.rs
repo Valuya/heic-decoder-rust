@@ -338,6 +338,69 @@ fn parse_grid_descriptor(body: &[u8]) -> Result<GridInfo> {
     Ok(GridInfo { rows, columns, output_width, output_height })
 }
 
+/// An `iovl` derived image (ISO/IEC 23008-12 clause 6.6.2.2): input images
+/// placed, in reference order, on a canvas filled with one colour.
+#[derive(Debug, Clone)]
+pub struct OverlayInfo {
+    /// `canvas_fill_value`: red, green, blue and alpha, 16 bits each.
+    pub canvas_fill: [u16; 4],
+    pub output_width: u32,
+    pub output_height: u32,
+    /// Placements in `dimg` reference order, later ones drawn over earlier ones.
+    pub inputs: Vec<OverlayInput>,
+    /// Each distinct input item, resolved once with its own alpha and transforms.
+    pub images: Vec<ParsedHeif>,
+}
+
+/// One input of an overlay: `images[image]` with its top-left corner at
+/// `(x, y)` on the canvas. Offsets may be negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayInput {
+    pub image: usize,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayDescriptor {
+    canvas_fill: [u16; 4],
+    output_width: u32,
+    output_height: u32,
+    offsets: Vec<(i32, i32)>,
+}
+
+/// `ImageOverlay` (ISO/IEC 23008-12 clause 6.6.2.2.2), like `ImageGrid` not a
+/// full box: `version`(8) + `flags`(8), `canvas_fill_value` as four 16-bit
+/// values, then `output_width`/`output_height` and a signed horizontal and
+/// vertical offset per input, as 16-bit fields, or 32-bit if `flags & 1`.
+fn parse_overlay_descriptor(body: &[u8], inputs: usize) -> Result<OverlayDescriptor> {
+    let mut r = ByteReader::new(body);
+    if r.u8()? != 0 {
+        return Err(HeifError::Unsupported("overlay: descriptor version"));
+    }
+    let wide = r.u8()? & 1 != 0;
+    let canvas_fill = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
+    let mut unsigned = || -> Result<u32> { if wide { r.u32() } else { r.u16().map(u32::from) } };
+    let (output_width, output_height) = (unsigned()?, unsigned()?);
+    if output_width == 0 || output_height == 0 {
+        return Err(HeifError::MalformedBox("overlay: zero output dimension"));
+    }
+    if u64::from(output_width) * u64::from(output_height) > crate::MAX_IMAGE_PIXELS {
+        return Err(HeifError::LimitExceeded("overlay: canvas larger than MAX_IMAGE_PIXELS"));
+    }
+    // Each offset takes at least four bytes: check before reserving for them.
+    let field = if wide { 4 } else { 2 };
+    if r.remaining() / (2 * field) < inputs {
+        return Err(HeifError::MalformedBox("overlay: fewer offsets than input images"));
+    }
+    let mut offsets = Vec::with_capacity(inputs);
+    for _ in 0..inputs {
+        let mut signed = || -> Result<i32> { if wide { r.u32().map(|v| v as i32) } else { r.u16().map(|v| i32::from(v as i16)) } };
+        offsets.push((signed()?, signed()?));
+    }
+    Ok(OverlayDescriptor { canvas_fill, output_width, output_height, offsets })
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedImage {
     pub hevc_config: HevcDecoderConfig,
@@ -377,6 +440,9 @@ pub struct ParsedHeif {
     /// `hvc1` tiles (`images` then holds `rows*columns` entries, in
     /// raster order: row-major, top-left first).
     pub grid: Option<GridInfo>,
+    /// `Some` when the image is an `iovl` overlay; `images` is then empty and
+    /// the coded images are those of the overlay's inputs.
+    pub overlay: Option<OverlayInfo>,
     pub images: Vec<ResolvedImage>,
     /// Source and enclosing identity items' `clap`/`irot`/`imir` properties,
     /// applied source-first to the fully assembled picture.
@@ -431,10 +497,6 @@ pub fn split_length_prefixed_nalus(data: &[u8], length_size: usize) -> Result<Ve
 /// configuration and coded sample bytes.
 pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
     let _timer = crate::timing::start(crate::timing::Stage::Container);
-    parse_selected(file, None, true)
-}
-
-fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Result<ParsedHeif> {
     let mut saw_ftyp = false;
     let mut meta_body_range: Option<(usize, usize)> = None;
     let mut moov_body_range = None;
@@ -472,31 +534,45 @@ fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Re
     }
     let (meta_start, meta_end) = meta_body_range.ok_or(HeifError::NotHeif("missing meta box"))?;
     let meta_body = file.get(meta_start..meta_end).ok_or(HeifError::MalformedBox("meta box out of bounds"))?;
+    let meta = read_meta(meta_body)?;
+    let primary_item_id = meta.primary_item_id.ok_or(HeifError::NotHeif("missing pitm box"))?;
+    if meta.iloc.is_none() {
+        return Err(HeifError::NotHeif("missing iloc box"));
+    }
+    resolve_item(file, &meta, primary_item_id, Resolve::Primary)
+}
 
+/// What a `meta` box says about its items, read once and shared by every
+/// item resolved from it: the primary image, its alpha and overlay inputs.
+#[derive(Default)]
+struct Meta {
+    primary_item_id: Option<u32>,
+    iloc: Option<BTreeMap<u32, IlocEntry>>,
+    item_types: BTreeMap<u32, [u8; 4]>,
+    xmp_items: Vec<u32>,
+    ipco_bodies: Vec<Vec<u8>>,
+    ipco_kinds: Vec<[u8; 4]>,
+    ipma: BTreeMap<u32, Vec<u32>>,
+    idat: Vec<u8>,
+    iref_body: Option<Vec<u8>>,
+}
+
+fn read_meta(meta_body: &[u8]) -> Result<Meta> {
     // `meta` is itself a full box (version/flags) followed by children.
     let mut mr = ByteReader::new(meta_body);
     full_box_header(&mut mr)?;
     let children_start = mr.pos();
-
-    let mut primary_item_id: Option<u32> = None;
-    let mut iloc: Option<BTreeMap<u32, IlocEntry>> = None;
-    let mut item_types: BTreeMap<u32, [u8; 4]> = BTreeMap::new();
-    let mut xmp_items: Vec<u32> = Vec::new();
-    let mut ipco_bodies: Vec<Vec<u8>> = Vec::new();
-    let mut ipco_kinds: Vec<[u8; 4]> = Vec::new();
-    let mut ipma: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    let mut idat: Vec<u8> = Vec::new();
-    let mut iref_body: Option<Vec<u8>> = None;
+    let mut meta = Meta::default();
 
     for_each_child(meta_body, children_start, meta_body.len(), 0, |kind, body| {
         match kind {
             b"pitm" => {
                 let mut r = ByteReader::new(body);
                 let (version, _flags) = full_box_header(&mut r)?;
-                primary_item_id = Some(if version == 0 { r.u16()? as u32 } else { r.u32()? });
+                meta.primary_item_id = Some(if version == 0 { r.u16()? as u32 } else { r.u32()? });
             }
             b"iloc" => {
-                iloc = Some(parse_iloc(body)?);
+                meta.iloc = Some(parse_iloc(body)?);
             }
             b"iinf" => {
                 let mut r = ByteReader::new(body);
@@ -517,10 +593,10 @@ fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Re
                     let item_id = if iversion == 2 { ir.u16()? as u32 } else { ir.u32()? };
                     let _protection_index = ir.u16()?;
                     let item_type = ir.fourcc()?;
-                    item_types.insert(item_id, item_type);
+                    meta.item_types.insert(item_id, item_type);
                     // `mime` items name their content type after `item_name`.
                     if &item_type == b"mime" && ir.c_string().and_then(|_| ir.c_string()).is_ok_and(|t| t == b"application/rdf+xml") {
-                        xmp_items.push(item_id);
+                        meta.xmp_items.push(item_id);
                     }
                     Ok(())
                 })?;
@@ -529,40 +605,53 @@ fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Re
                 for_each_child(body, 0, body.len(), 0, |pkind, pbody| {
                     if pkind == b"ipco" {
                         for prop in parse_ipco(pbody)? {
-                            ipco_kinds.push(prop.kind);
-                            ipco_bodies.push(prop.body.to_vec());
+                            meta.ipco_kinds.push(prop.kind);
+                            meta.ipco_bodies.push(prop.body.to_vec());
                         }
                     } else if pkind == b"ipma" {
                         for (item_id, indices) in parse_ipma(pbody)? {
-                            ipma.insert(item_id, indices);
+                            meta.ipma.insert(item_id, indices);
                         }
                     }
                     Ok(())
                 })?;
             }
             b"idat" => {
-                idat = body.to_vec();
+                meta.idat = body.to_vec();
             }
             b"iref" => {
-                iref_body = Some(body.to_vec());
+                meta.iref_body = Some(body.to_vec());
             }
             _ => {}
         }
         Ok(())
     })?;
+    Ok(meta)
+}
 
-    let primary_item_id = selected.or(primary_item_id).ok_or(HeifError::NotHeif("missing pitm box"))?;
-    let iloc = iloc.ok_or(HeifError::NotHeif("missing iloc box"))?;
+/// Which image an item is resolved as. Only the primary image may be an
+/// overlay; its inputs and alpha planes are coded or grid images.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolve {
+    Primary,
+    OverlayInput,
+    Alpha,
+}
 
-    let chain = identity_chain(&item_types, iref_body.as_deref(), primary_item_id)?;
-    let alpha = if include_alpha { resolve_alpha(file, &item_types, &ipma, &ipco_kinds, &ipco_bodies, iref_body.as_deref(), &chain)? } else { None };
+fn resolve_item(file: &[u8], meta: &Meta, primary_item_id: u32, role: Resolve) -> Result<ParsedHeif> {
+    let Meta { iloc, item_types, xmp_items, ipco_bodies, ipco_kinds, ipma, idat, iref_body, .. } = meta;
+    let iloc = iloc.as_ref().ok_or(HeifError::NotHeif("missing iloc box"))?;
+    let iref_body = iref_body.as_deref();
+
+    let chain = identity_chain(item_types, iref_body, primary_item_id)?;
+    let alpha = if role == Resolve::Alpha { None } else { resolve_alpha(file, meta, &chain)? };
     let source_id = *chain.last().ok_or(HeifError::MalformedBox("empty image reference chain"))?;
     // Source transforms apply first, then each enclosing identity item.
     let mut transforms = Vec::new();
     for &item_id in chain.iter().rev() {
-        transforms.extend(resolve_transforms(&ipma, &ipco_kinds, &ipco_bodies, item_id)?);
+        transforms.extend(resolve_transforms(ipma, ipco_kinds, ipco_bodies, item_id)?);
     }
-    let reference_ids = match iref_body.as_deref() {
+    let reference_ids = match iref_body {
         Some(body) => parse_iref(body, source_id, b"pred")?,
         None => Vec::new(),
     };
@@ -578,45 +667,37 @@ fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Re
         if item_types.get(&source_id) != Some(b"hvc1") || item_types.get(reference_id) != Some(b"hvc1") {
             return Err(HeifError::Unsupported("prediction: dependencies must be hvc1 images"));
         }
-        if let Some(body) = iref_body.as_deref()
+        if let Some(body) = iref_body
             && !parse_iref(body, *reference_id, b"pred")?.is_empty()
         {
             return Err(HeifError::Unsupported("prediction: chained reference images"));
         }
         Some(ResolvedImage {
-            hevc_config: resolve_hvcc(&ipma, &ipco_kinds, &ipco_bodies, *reference_id)?,
-            data: resolve_item_bytes(file, &idat, &iloc, *reference_id)?,
+            hevc_config: resolve_hvcc(ipma, ipco_kinds, ipco_bodies, *reference_id)?,
+            data: resolve_item_bytes(file, idat, iloc, *reference_id)?,
         })
     };
     let exif_items: Vec<u32> = item_types.iter().filter(|(_, t)| *t == b"Exif").map(|(id, _)| *id).collect();
-    let metadata_item =
-        |candidates: &[u32]| describing_item(candidates, iref_body.as_deref(), &chain).and_then(|id| resolve_item_bytes(file, &idat, &iloc, id).ok());
+    let metadata_item = |candidates: &[u32]| describing_item(candidates, iref_body, &chain).and_then(|id| resolve_item_bytes(file, idat, iloc, id).ok());
     let mut metadata = Metadata {
-        color_info: resolve_color_info(&ipma, &ipco_kinds, &ipco_bodies, &chain)?,
-        icc_profile: resolve_icc(&ipma, &ipco_kinds, &ipco_bodies, &chain),
+        color_info: resolve_color_info(ipma, ipco_kinds, ipco_bodies, &chain)?,
+        icc_profile: resolve_icc(ipma, ipco_kinds, ipco_bodies, &chain),
         exif: metadata_item(&exif_items).and_then(|payload| exif_tiff(&payload)),
-        xmp: metadata_item(&xmp_items),
+        xmp: metadata_item(xmp_items),
     };
+    let parsed =
+        |grid, overlay, images, metadata| ParsedHeif { alpha, reference_image, sequence: None, primary_item_id, grid, overlay, images, transforms, metadata };
     match item_types.get(&source_id) {
         Some(b"hvc1") => {
-            let hevc_config = resolve_hvcc(&ipma, &ipco_kinds, &ipco_bodies, source_id)?;
-            let data = resolve_item_bytes(file, &idat, &iloc, source_id)?;
-            Ok(ParsedHeif {
-                alpha,
-                reference_image,
-                sequence: None,
-                primary_item_id,
-                grid: None,
-                images: vec![ResolvedImage { hevc_config, data }],
-                transforms,
-                metadata,
-            })
+            let hevc_config = resolve_hvcc(ipma, ipco_kinds, ipco_bodies, source_id)?;
+            let data = resolve_item_bytes(file, idat, iloc, source_id)?;
+            Ok(parsed(None, None, vec![ResolvedImage { hevc_config, data }], metadata))
         }
         Some(b"grid") => {
-            let grid_bytes = resolve_item_bytes(file, &idat, &iloc, source_id)?;
+            let grid_bytes = resolve_item_bytes(file, idat, iloc, source_id)?;
             let grid_info = parse_grid_descriptor(&grid_bytes)?;
             let iref_body = iref_body.ok_or(HeifError::MalformedBox("grid item but no iref box"))?;
-            let tile_ids = parse_iref(&iref_body, source_id, b"dimg")?;
+            let tile_ids = parse_iref(iref_body, source_id, b"dimg")?;
             let expected_tiles =
                 (grid_info.rows as usize).checked_mul(grid_info.columns as usize).ok_or(HeifError::MalformedBox("grid dimensions overflow"))?;
             if tile_ids.is_empty() || tile_ids.len() != expected_tiles {
@@ -629,20 +710,63 @@ fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Re
                     Some(_) => return Err(HeifError::Unsupported("grid tile is not type 'hvc1' (mixed-codec grids not supported)")),
                     None => return Err(HeifError::MalformedBox("grid tile has no iinf entry")),
                 }
-                let hevc_config = resolve_hvcc(&ipma, &ipco_kinds, &ipco_bodies, tile_id)?;
-                let data = resolve_item_bytes(file, &idat, &iloc, tile_id)?;
+                let hevc_config = resolve_hvcc(ipma, ipco_kinds, ipco_bodies, tile_id)?;
+                let data = resolve_item_bytes(file, idat, iloc, tile_id)?;
                 images.push(ResolvedImage { hevc_config, data });
             }
             // Some writers attach the profile to the tiles rather than the grid.
             if metadata.icc_profile.is_none() {
-                metadata.icc_profile = resolve_icc(&ipma, &ipco_kinds, &ipco_bodies, &tile_ids);
+                metadata.icc_profile = resolve_icc(ipma, ipco_kinds, ipco_bodies, &tile_ids);
             }
             if metadata.color_info.is_none() {
-                metadata.color_info = resolve_color_info(&ipma, &ipco_kinds, &ipco_bodies, &tile_ids)?;
+                metadata.color_info = resolve_color_info(ipma, ipco_kinds, ipco_bodies, &tile_ids)?;
             }
-            Ok(ParsedHeif { alpha, reference_image, sequence: None, primary_item_id, grid: Some(grid_info), images, transforms, metadata })
+            Ok(parsed(Some(grid_info), None, images, metadata))
         }
-        Some(_) => Err(HeifError::Unsupported("resolved image item is not type 'hvc1' or 'grid'")),
+        Some(b"iovl") if role == Resolve::Primary => {
+            let iref_body = iref_body.ok_or(HeifError::MalformedBox("overlay item but no iref box"))?;
+            let input_ids = parse_iref(iref_body, source_id, b"dimg")?;
+            if input_ids.is_empty() {
+                return Err(HeifError::MalformedBox("overlay: no input images"));
+            }
+            let descriptor = parse_overlay_descriptor(&resolve_item_bytes(file, idat, iloc, source_id)?, input_ids.len())?;
+            // An item placed more than once is resolved, and its coded bytes
+            // copied, once.
+            let mut images: Vec<ParsedHeif> = Vec::new();
+            let mut resolved: BTreeMap<u32, usize> = BTreeMap::new();
+            let mut inputs = Vec::with_capacity(input_ids.len());
+            for (&input_id, &(x, y)) in input_ids.iter().zip(&descriptor.offsets) {
+                if chain.contains(&input_id) {
+                    return Err(HeifError::MalformedBox("overlay: self reference"));
+                }
+                let image = match resolved.get(&input_id) {
+                    Some(&index) => index,
+                    None => {
+                        images.push(resolve_item(file, meta, input_id, Resolve::OverlayInput)?);
+                        resolved.insert(input_id, images.len() - 1);
+                        images.len() - 1
+                    }
+                };
+                inputs.push(OverlayInput { image, x, y });
+            }
+            // As for grids, the colour description may sit on the inputs.
+            if metadata.icc_profile.is_none() {
+                metadata.icc_profile = images.iter().find_map(|image| image.metadata.icc_profile.clone());
+            }
+            if metadata.color_info.is_none() {
+                metadata.color_info = images.iter().find_map(|image| image.metadata.color_info);
+            }
+            let overlay = OverlayInfo {
+                canvas_fill: descriptor.canvas_fill,
+                output_width: descriptor.output_width,
+                output_height: descriptor.output_height,
+                inputs,
+                images,
+            };
+            Ok(parsed(None, Some(overlay), Vec::new(), metadata))
+        }
+        Some(b"iovl") => Err(HeifError::Unsupported("overlay: an overlay as an overlay input or alpha plane is not supported")),
+        Some(_) => Err(HeifError::Unsupported("resolved image item is not type 'hvc1', 'grid' or 'iovl'")),
         None => Err(HeifError::MalformedBox("primary item has no iinf entry")),
     }
 }
@@ -677,17 +801,9 @@ fn auxiliary_links(body: &[u8], wanted: &[u8; 4]) -> Result<BTreeMap<u32, Vec<u3
 
 // Alpha is identified by its auxiliary type AND an auxl link to the selected
 // image/identity chain. Depth maps and unrelated auxiliary images are ignored.
-#[allow(clippy::too_many_arguments)]
-fn resolve_alpha(
-    file: &[u8],
-    types: &BTreeMap<u32, [u8; 4]>,
-    ipma: &BTreeMap<u32, Vec<u32>>,
-    kinds: &[[u8; 4]],
-    bodies: &[Vec<u8>],
-    references: Option<&[u8]>,
-    chain: &[u32],
-) -> Result<Option<AuxiliaryAlpha>> {
-    let Some(references) = references else {
+fn resolve_alpha(file: &[u8], meta: &Meta, chain: &[u32]) -> Result<Option<AuxiliaryAlpha>> {
+    let Meta { item_types: types, ipma, ipco_kinds: kinds, ipco_bodies: bodies, .. } = meta;
+    let Some(references) = meta.iref_body.as_deref() else {
         return Ok(None);
     };
     let links = auxiliary_links(references, b"auxl")?;
@@ -731,9 +847,9 @@ fn resolve_alpha(
     }
     let prem_links = auxiliary_links(references, b"prem")?;
     let premultiplied = chain.iter().any(|master| prem_links.get(master).is_some_and(|targets| targets.contains(&id)));
-    // One bounded reparse reuses the same grid/identity validation. Nested
+    // Resolving it as an image reuses the same grid/identity validation. Nested
     // auxiliaries are deliberately not traversed, avoiding recursive cycles.
-    let image = parse_selected(file, Some(id), false)?;
+    let image = resolve_item(file, meta, id, Resolve::Alpha)?;
     Ok(Some(AuxiliaryAlpha { image: Box::new(image), premultiplied }))
 }
 
@@ -981,7 +1097,15 @@ mod tests {
             [reference(b"auxl", 2, 1), reference(b"auxl", 3, 1)].concat(),
         ] {
             let body = full_box_body(0, 0, &entries);
-            assert!(resolve_alpha(&[], &types, &ipma, &kinds, &bodies, Some(&body), &[1]).is_err());
+            let meta = Meta {
+                item_types: types.clone(),
+                ipma: ipma.clone(),
+                ipco_kinds: kinds.to_vec(),
+                ipco_bodies: bodies.to_vec(),
+                iref_body: Some(body),
+                ..Meta::default()
+            };
+            assert!(resolve_alpha(&[], &meta, &[1]).is_err());
         }
         // Version 1 references use 32-bit IDs rather than silently truncating.
         let body =
@@ -1221,6 +1345,68 @@ mod tests {
         assert!(parse_grid_descriptor(&grid(8064, 6048)).is_ok());
         assert!(matches!(parse_grid_descriptor(&grid(u32::MAX, u32::MAX)), Err(HeifError::LimitExceeded(_))));
         assert!(matches!(parse_grid_descriptor(&grid(0, 512)), Err(HeifError::MalformedBox(_))));
+    }
+
+    #[test]
+    fn overlay_descriptor_reads_both_field_sizes_and_signed_offsets() {
+        // version, flags, RGBA fill, width, height, then x/y per input.
+        let narrow =
+            [&[0u8, 0][..], &[0x12, 0x34, 0, 0, 0xFF, 0xFF, 0x80, 0x00], &[0x05, 0xA0, 0x03, 0xC0], &[0xFE, 0xC0, 0xFF, 0x4C, 0x00, 0x50, 0x00, 0x78]].concat();
+        let parsed = parse_overlay_descriptor(&narrow, 2).unwrap();
+        assert_eq!(parsed.canvas_fill, [0x1234, 0, 0xFFFF, 0x8000]);
+        assert_eq!((parsed.output_width, parsed.output_height), (1440, 960));
+        assert_eq!(parsed.offsets, vec![(-320, -180), (80, 120)]);
+        // Trailing bytes after the last offset are ignored.
+        assert_eq!(parse_overlay_descriptor(&[&narrow[..], &[0, 0]].concat(), 2).unwrap(), parsed);
+        let wide = [&[0u8, 1][..], &[0; 8], &70_000u32.to_be_bytes(), &2u32.to_be_bytes(), &(-70_000i32).to_be_bytes(), &5i32.to_be_bytes()].concat();
+        let parsed = parse_overlay_descriptor(&wide, 1).unwrap();
+        assert_eq!((parsed.output_width, parsed.output_height, parsed.offsets[0]), (70_000, 2, (-70_000, 5)));
+    }
+
+    #[test]
+    fn malformed_overlay_descriptors_are_errors() {
+        let good = [&[0u8, 0][..], &[0; 8], &[0, 8, 0, 4], &[0, 1, 0, 2]].concat();
+        assert!(parse_overlay_descriptor(&good, 1).is_ok());
+        for length in 0..good.len() {
+            assert!(parse_overlay_descriptor(&good[..length], 1).is_err(), "{length} bytes");
+        }
+        assert!(matches!(parse_overlay_descriptor(&good, 2), Err(HeifError::MalformedBox(_))));
+        assert!(matches!(parse_overlay_descriptor(&good, usize::MAX), Err(HeifError::MalformedBox(_))));
+        let mut version = good.clone();
+        version[0] = 1;
+        assert!(matches!(parse_overlay_descriptor(&version, 1), Err(HeifError::Unsupported(_))));
+        let mut empty = good.clone();
+        empty[10..12].fill(0);
+        assert!(matches!(parse_overlay_descriptor(&empty, 1), Err(HeifError::MalformedBox(_))));
+        let huge = [&[0u8, 1][..], &[0; 8], &u32::MAX.to_be_bytes(), &u32::MAX.to_be_bytes(), &[0; 8]].concat();
+        assert!(matches!(parse_overlay_descriptor(&huge, 1), Err(HeifError::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn overlays_reject_self_references_nesting_and_missing_inputs() {
+        let descriptor = [&[0u8, 0][..], &[0; 8], &[0, 8, 0, 4], &[0; 4]].concat();
+        let meta = |types: &[(u32, &[u8; 4])], references: Option<Vec<u8>>| Meta {
+            iloc: Some(BTreeMap::from([(
+                1,
+                IlocEntry {
+                    construction_method: ConstructionMethod::IdatOffset,
+                    base_offset: 0,
+                    extents: vec![IlocExtent { offset: 0, length: descriptor.len() as u64 }],
+                },
+            )])),
+            item_types: types.iter().map(|&(id, kind)| (id, *kind)).collect(),
+            idat: descriptor.clone(),
+            iref_body: references,
+            ..Meta::default()
+        };
+        let error = |meta: &Meta| resolve_item(&[], meta, 1, Resolve::Primary).unwrap_err();
+        let types: &[(u32, &[u8; 4])] = &[(1, b"iovl"), (2, b"iovl"), (3, b"hvc1")];
+        assert!(matches!(error(&meta(types, None)), HeifError::MalformedBox(_)));
+        assert!(matches!(error(&meta(types, Some(identity_references(&[(1, &[])])))), HeifError::MalformedBox(_)));
+        assert!(matches!(error(&meta(types, Some(identity_references(&[(1, &[1])])))), HeifError::MalformedBox(_)));
+        assert!(matches!(error(&meta(types, Some(identity_references(&[(1, &[2])])))), HeifError::Unsupported(_)));
+        // Two placements need two offsets.
+        assert!(matches!(error(&meta(types, Some(identity_references(&[(1, &[3, 3])])))), HeifError::MalformedBox(_)));
     }
 
     #[test]
