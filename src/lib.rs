@@ -9,6 +9,8 @@
 //! [`DecodedImage::to_rgb16`] when the caller needs interleaved RGB.
 //! Auxiliary alpha is returned in [`DecodedImage::alpha`]; use
 //! [`DecodedImage::to_rgba8`] or [`DecodedImage::to_rgba16`] to retain it.
+//! Overlay (`iovl`) images are composed in RGB, as libheif composes them, and
+//! returned as 4:4:4 coded with the identity matrix.
 //!
 //! ```no_run
 //! let data = std::fs::read("photo.heic")?;
@@ -42,6 +44,7 @@ pub mod isobmff;
 #[cfg(not(feature = "internals"))]
 #[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
 mod isobmff;
+mod overlay;
 mod rgb;
 #[cfg(feature = "timing")]
 #[doc(hidden)]
@@ -83,6 +86,8 @@ pub struct AlphaPlane {
 
 /// A decoded still image: monochrome or planar YCbCr (4:2:0, 4:2:2 or 4:4:4),
 /// `bit_depth` bits per sample, values in `0 ..= (1<<bit_depth)-1`.
+/// A composed overlay is RGB 4:4:4 coded with the identity matrix
+/// (`color_info.matrix_coefficients == 0`, full range): G, B, R in `y`, `cb`, `cr`.
 /// RGB/RGBA conversion is optional via the `to_rgb*`/`to_rgba*` methods.
 /// Clean-aperture output retains native samples: the chroma origin is the
 /// cell containing the final luma crop origin, with ceil-divided extents.
@@ -433,7 +438,10 @@ fn blit_tiles(canvas: &mut DecodedImage, tiles: &[DecodedImage], columns: u32, t
 
 /// Decodes a HEIF/HEIC file's primary image — a single `hvc1` image, or
 /// an identity-derived image, or a `grid` of `hvc1` tiles stitched into one picture (what real
-/// full-resolution iPhone photos use) — to planar YCbCr.
+/// full-resolution iPhone photos use) — to planar YCbCr. An `iovl` overlay is
+/// composed in RGB, as libheif composes it, and returned as 4:4:4 coded with
+/// the identity matrix (`matrix_coefficients` 0): green in `y`, blue in `cb`,
+/// red in `cr`, which [`DecodedImage::to_rgb8`] turns back into RGB.
 /// With no still-image metadata, selects one sync sample from an image/video
 /// sequence track. This does not implement playback, timing or edit lists.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
@@ -458,17 +466,38 @@ impl Default for DecodeOptions {
 /// [`decode`] with explicit settings.
 pub fn decode_with(bytes: &[u8], options: &DecodeOptions) -> Result<DecodedImage> {
     let mut parsed = isobmff::parse(bytes)?;
-    let metadata = std::mem::take(&mut parsed.metadata);
-    let mut image = decode_pixels(&parsed, options.apply_transforms)?;
+    let mut image = decode_item(&parsed, options.apply_transforms, &RgbOptions::default())?;
+    image.metadata = std::mem::take(&mut parsed.metadata);
+    Ok(image)
+}
+
+/// The image as [`decode`] returns it, for RGB conversion with `rgb`, and the
+/// options to convert it with: an overlay's inputs are converted with `rgb`
+/// while composing, and the composed picture is already RGB.
+pub(crate) fn decode_for_rgb(bytes: &[u8], rgb: &RgbOptions) -> Result<(DecodedImage, RgbOptions)> {
+    let parsed = isobmff::parse(bytes)?;
+    let image = decode_item(&parsed, true, rgb)?;
+    Ok((image, if parsed.overlay.is_some() { RgbOptions { color: None, ..*rgb } } else { *rgb }))
+}
+
+/// One resolved image with its alpha and effective colour description,
+/// without the file's metadata. `rgb` converts an overlay's inputs.
+pub(crate) fn decode_item(parsed: &isobmff::ParsedHeif, transform: bool, rgb: &RgbOptions) -> Result<DecodedImage> {
+    let mut image = match parsed.overlay {
+        Some(_) => overlay::compose(parsed, transform, rgb)?,
+        None => decode_pixels(parsed, transform)?,
+    };
     if let Some(auxiliary) = &parsed.alpha {
-        let alpha = decode_pixels(&auxiliary.image, options.apply_transforms)?;
+        let alpha = decode_pixels(&auxiliary.image, transform)?;
         if alpha.width != image.width || alpha.height != image.height {
             return Err(HeifError::Unsupported("alpha: display dimensions do not match colour image"));
         }
         image.alpha = Some(AlphaPlane { bit_depth: alpha.bit_depth_luma, samples: alpha.y, premultiplied: auxiliary.premultiplied });
     }
-    image.color_info = metadata.color_info.or(image.color_info);
-    image.metadata = metadata;
+    // A composed overlay is RGB whatever its `colr` says about matrix and range.
+    if parsed.overlay.is_none() {
+        image.color_info = parsed.metadata.color_info.or(image.color_info);
+    }
     Ok(image)
 }
 
@@ -479,11 +508,13 @@ pub struct ImageInfo {
     /// Size after the container's crop, rotation and mirroring.
     pub width: usize,
     pub height: usize,
-    /// Size before those transforms (after grid assembly and SPS cropping).
+    /// Size before those transforms (after grid assembly and SPS cropping, or
+    /// an overlay's canvas).
     pub coded_width: usize,
     pub coded_height: usize,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
+    /// 3 for an overlay, which [`decode`] returns as RGB 4:4:4.
     pub chroma_format_idc: u32,
     /// Bit depth of the auxiliary alpha image, if the file has one.
     pub alpha_bit_depth: Option<u32>,
@@ -493,22 +524,23 @@ pub struct ImageInfo {
 /// decoding pixels, so callers can apply their own limits first.
 pub fn probe(bytes: &[u8]) -> Result<ImageInfo> {
     let parsed = isobmff::parse(bytes)?;
-    let (coded_width, coded_height, sps) = coded_size(&parsed)?;
+    let (coded_width, coded_height, bit_depth_luma, bit_depth_chroma, chroma_format_idc) = match &parsed.overlay {
+        // Composed as RGB 4:4:4 at the canvas depth.
+        Some(overlay) => {
+            let depth = overlay::canvas_bit_depth(overlay)?;
+            (overlay.output_width as usize, overlay.output_height as usize, depth, depth, 3)
+        }
+        None => {
+            let (width, height, sps) = coded_size(&parsed)?;
+            (width, height, sps.bit_depth_luma, sps.bit_depth_chroma, sps.chroma_format_idc)
+        }
+    };
     let (width, height) = transformed_size(coded_width, coded_height, &parsed.transforms)?;
     let alpha_bit_depth = match &parsed.alpha {
         Some(auxiliary) => Some(coded_size(&auxiliary.image)?.2.bit_depth_luma),
         None => None,
     };
-    Ok(ImageInfo {
-        width,
-        height,
-        coded_width,
-        coded_height,
-        bit_depth_luma: sps.bit_depth_luma,
-        bit_depth_chroma: sps.bit_depth_chroma,
-        chroma_format_idc: sps.chroma_format_idc,
-        alpha_bit_depth,
-    })
+    Ok(ImageInfo { width, height, coded_width, coded_height, bit_depth_luma, bit_depth_chroma, chroma_format_idc, alpha_bit_depth })
 }
 
 /// Output size before container transforms, and the first image's SPS.
