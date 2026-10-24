@@ -53,7 +53,13 @@ fn check(path: &Path) -> usize {
         DecodeRgbOptions { alpha: AlphaMode::Over([255, 128, 0]), ..Default::default() },
     ];
     let mut compared = 0;
+    // An overlay's inputs are converted with `rgb` before they are composed
+    // (tests/overlay.rs checks it); `decode` composes them with the defaults.
+    let overlay = heic_decoder::isobmff::parse(&data).is_ok_and(|parsed| parsed.overlay.is_some());
     for options in &cases {
+        if overlay && options.rgb.upsampling != ChromaUpsampling::default() {
+            continue;
+        }
         let Ok(want) = planar(&data, options) else { continue };
         let got = heic_decoder::decode_rgb8_with(&data, options).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!((got.width, got.height), (want.width, want.height), "{}", path.display());

@@ -5,7 +5,9 @@
 //! 12 MP iPhone photo, 3.5 GB for 200 MP. [`decode_rgb8`] decodes a grid one
 //! row of tiles at a time and converts each source row as soon as the chroma
 //! rows it reads are decoded, then lets them go. Its output is bit-identical
-//! to `decode(..)?.to_rgb8_with_options(..)`: the container's crop, rotation
+//! to `decode(..)?.to_rgb8_with_options(..)` (but for an overlay, whose inputs
+//! are converted with the options before they are composed, where `decode`
+//! composes them with the defaults): the container's crop, rotation
 //! and mirroring are resolved into per-axis index maps with the same chroma
 //! geometry [`crate::decode`] would produce, and every pixel goes through the
 //! same arithmetic, in the same order, as the planar converter.
@@ -14,7 +16,7 @@
 //! smaller image as they are produced, so only the output is ever held.
 //!
 //! Files this does not stream — a predicted image, a grid with uneven or
-//! odd-sized tiles, an alpha plane to composite — go through
+//! odd-sized tiles, an alpha plane to composite, an overlay — go through
 //! [`crate::decode`] instead, under the same limits.
 
 use std::collections::VecDeque;
@@ -49,6 +51,7 @@ pub struct DecodeRgbOptions {
     pub max_edge: Option<usize>,
     pub alpha: AlphaMode,
     /// Colour override and chroma upsampling, as for `to_rgb8_with_options`.
+    /// An overlay's inputs are converted with them before they are composed.
     pub rgb: RgbOptions,
     /// Largest coded picture (one grid tile, or a whole non-grid image with
     /// its alpha and prediction reference), in luma samples as the SPS
@@ -114,6 +117,10 @@ pub fn decode_rgb8_with(bytes: &[u8], options: &DecodeRgbOptions) -> Result<RgbI
         return Err(too_large());
     }
 
+    if let Some(overlay) = &parsed.overlay {
+        crate::overlay::check_limits(overlay, options.max_picture_pixels, options.max_total_pixels)?;
+        return through_decode(bytes, options);
+    }
     if parsed.reference_image.is_some() {
         let mut pixels = tile_pixels.iter().sum::<u64>();
         if let Some(image) = &parsed.reference_image {
@@ -137,14 +144,14 @@ fn picture_pixels(image: &ResolvedImage) -> Result<u64> {
 
 /// `decode` and the planar converter, for the files [`stream`] leaves out.
 fn through_decode(bytes: &[u8], options: &DecodeRgbOptions) -> Result<RgbImage<u8>> {
-    let image = crate::decode(bytes)?;
+    let (image, rgb_options) = crate::decode_for_rgb(bytes, &options.rgb)?;
     let rgb = match options.alpha {
         AlphaMode::Over(background) if image.alpha.is_some() => {
-            let rgba = image.to_rgba8_with_options(&options.rgb)?;
+            let rgba = image.to_rgba8_with_options(&rgb_options)?;
             let data = rgba.data.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, a]| over([r, g, b], a, background)).collect();
             RgbImage { width: rgba.width, height: rgba.height, data }
         }
-        _ => image.to_rgb8_with_options(&options.rgb)?,
+        _ => image.to_rgb8_with_options(&rgb_options)?,
     };
     drop(image);
     let full = (rgb.width, rgb.height);
