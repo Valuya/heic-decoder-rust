@@ -129,15 +129,30 @@ fn find_and_parse<T>(nalus: impl Iterator<Item = impl AsRef<[u8]>>, expected_typ
 /// Unstable: only with the `internals` feature.
 #[cfg(feature = "internals")]
 pub fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
-    decode_with_reference(image, None)
+    decode_into(image, None, Picture::empty())
 }
 
-#[cfg(not(feature = "internals"))]
-fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
-    decode_with_reference(image, None)
+/// Pictures kept for their buffers: a grid's tiles are decoded into them in
+/// turn, on whichever thread, instead of each allocating its own.
+#[derive(Default)]
+struct PicturePool(std::sync::Mutex<Vec<Picture>>);
+
+impl PicturePool {
+    /// A picture to [`decode_into`], recycled if one is free.
+    fn take(&self) -> Picture {
+        self.0.lock().ok().and_then(|mut free| free.pop()).unwrap_or_else(Picture::empty)
+    }
+
+    /// Hands a picture's buffers to the next tile.
+    fn give(&self, pic: Picture) {
+        if let Ok(mut free) = self.0.lock() {
+            free.push(pic);
+        }
+    }
 }
 
-fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> Result<(Sps, Picture)> {
+/// Decodes `image` into `pic`'s buffers, which it resets first.
+fn decode_into(image: &ResolvedImage, reference: Option<&Picture>, mut pic: Picture) -> Result<(Sps, Picture)> {
     let setup = timing::start(Stage::Headers);
     let sps: Sps = find_and_parse(image.hevc_config.nalus_of_type(NAL_SPS), NAL_SPS, parse_sps)?;
     let pps: Pps = find_and_parse(image.hevc_config.nalus_of_type(NAL_PPS), NAL_PPS, parse_pps)?;
@@ -157,7 +172,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
 
     let sub_w = if sps.chroma_format_idc == 0 { 0 } else { sps.sub_width_c() as usize };
     let sub_h = if sps.chroma_format_idc == 0 { 0 } else { sps.sub_height_c() as usize };
-    let mut pic = Picture::new(
+    pic.reset(
         sps.pic_width_in_luma_samples as usize,
         sps.pic_height_in_luma_samples as usize,
         sub_w,
@@ -291,44 +306,72 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     Ok((sps, pic))
 }
 
-fn image_from_picture(sps: &Sps, pic: Picture) -> Result<DecodedImage> {
-    let _timer = timing::start(Stage::Pack);
-    let cb_width = pic.cb.width;
-    let cb_height = pic.cb.height;
-    let image = DecodedImage {
-        alpha: None,
-        width: sps.pic_width_in_luma_samples as usize,
-        height: sps.pic_height_in_luma_samples as usize,
-        bit_depth_luma: sps.bit_depth_luma,
-        bit_depth_chroma: sps.bit_depth_chroma,
-        chroma_format_idc: sps.chroma_format_idc,
-        color_info: sps.color_info,
-        chroma_sampling: ChromaSampling::coded(sps.chroma_format_idc, sps.chroma_location),
-        y: pic.y.into_samples(),
-        cb: pic.cb.into_samples(),
-        cr: pic.cr.into_samples(),
-        cb_width,
-        cb_height,
-        metadata: isobmff::Metadata::default(),
-    };
+/// The SPS conformance window, when it crops anything.
+fn conformance_window(sps: &Sps) -> Result<Option<ImageWindow>> {
     if sps.conformance_window == [0; 4] {
-        return Ok(image);
+        return Ok(None);
     }
     let [left, right, top, bottom] = sps.conformance_window.map(|v| v as usize);
-    let width = image
-        .width
+    let width = (sps.pic_width_in_luma_samples as usize)
         .checked_sub(left)
         .and_then(|v| v.checked_sub(right))
         .filter(|&v| v != 0)
         .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
-    let height = image
-        .height
+    let height = (sps.pic_height_in_luma_samples as usize)
         .checked_sub(top)
         .and_then(|v| v.checked_sub(bottom))
         .filter(|&v| v != 0)
         .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
-    let (sub_w, sub_h) = chroma_subsampling(image.chroma_format_idc);
-    extract_window(image, ImageWindow { left, top, width, height }, sub_w, sub_h)
+    Ok(Some(ImageWindow { left, top, width, height }))
+}
+
+/// The picture's samples as `i32` planes, cropped to the SPS conformance
+/// window.
+fn image_from_picture(sps: &Sps, pic: &Picture) -> Result<DecodedImage> {
+    let _timer = timing::start(Stage::Pack);
+    let format = sps.chroma_format_idc;
+    let mut chroma_sampling = ChromaSampling::coded(format, sps.chroma_location);
+    let whole = |plane: &hevc::ctu::Plane| plane.crop(0, 0, plane.width, plane.height);
+    let (width, height, cb_width, cb_height, y, cb, cr) = match conformance_window(sps)? {
+        None => (
+            sps.pic_width_in_luma_samples as usize,
+            sps.pic_height_in_luma_samples as usize,
+            pic.cb.width,
+            pic.cb.height,
+            whole(&pic.y)?,
+            whole(&pic.cb)?,
+            whole(&pic.cr)?,
+        ),
+        // Native planar extraction: retain source samples, selecting chroma
+        // from the cell containing the final luma origin. No interpolation.
+        Some(ImageWindow { left, top, width, height }) => {
+            let (sub_w, sub_h) = chroma_subsampling(format);
+            let cb_width = if format == 0 { 0 } else { width.div_ceil(sub_w) };
+            let cb_height = if format == 0 { 0 } else { height.div_ceil(sub_h) };
+            let y = pic.y.crop(left, top, width, height)?;
+            let chroma = |plane: &hevc::ctu::Plane| if format == 0 { Ok(Vec::new()) } else { plane.crop(left / sub_w, top / sub_h, cb_width, cb_height) };
+            let (cb, cr) = (chroma(&pic.cb)?, chroma(&pic.cr)?);
+            chroma_sampling.origin_x -= (left % sub_w) as f32;
+            chroma_sampling.origin_y -= (top % sub_h) as f32;
+            (width, height, cb_width, cb_height, y, cb, cr)
+        }
+    };
+    Ok(DecodedImage {
+        alpha: None,
+        width,
+        height,
+        bit_depth_luma: sps.bit_depth_luma,
+        bit_depth_chroma: sps.bit_depth_chroma,
+        chroma_format_idc: format,
+        color_info: sps.color_info,
+        chroma_sampling,
+        y,
+        cb,
+        cr,
+        cb_width,
+        cb_height,
+        metadata: isobmff::Metadata::default(),
+    })
 }
 
 /// Copies `tile` into `canvas` at the raster position implied by
@@ -561,14 +604,14 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
                     return Err(HeifError::Unsupported("prediction dependency must be an IDR picture"));
                 }
             }
-            decode_one_image(image)
+            decode_into(image, None, Picture::empty())
         })
         .transpose()?;
 
     let Some(grid) = parsed.grid else {
         let image = parsed.images.first().ok_or(HeifError::MalformedBox("no image to decode"))?;
-        let (sps, pic) = decode_with_reference(image, reference.as_ref().map(|(_, pic)| pic))?;
-        return apply_transforms(image_from_picture(&sps, pic)?, transforms);
+        let (sps, pic) = decode_into(image, reference.as_ref().map(|(_, pic)| pic), Picture::empty())?;
+        return apply_transforms(image_from_picture(&sps, &pic)?, transforms);
     };
 
     if parsed.images.len() != (grid.rows as usize) * (grid.columns as usize) {
@@ -590,14 +633,18 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
 
     // Decode grid tiles in parallel using rayon
     use rayon::prelude::*;
+    let pool = PicturePool::default();
     let tiles: Vec<DecodedImage> = parsed
         .images
         .par_iter()
         .map(|image| {
-            let (sps, pic) = decode_one_image(image)?;
-            image_from_picture(&sps, pic)
+            let (sps, pic) = decode_into(image, None, pool.take())?;
+            let tile = image_from_picture(&sps, &pic);
+            pool.give(pic);
+            tile
         })
         .collect::<Result<Vec<_>>>()?;
+    drop(pool);
     let assembly = timing::start(Stage::Grid);
     let first = tiles.first().ok_or(HeifError::MalformedBox("grid has no tiles"))?;
     let (tile_width, tile_height) = (first.width, first.height);

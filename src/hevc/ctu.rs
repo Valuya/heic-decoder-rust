@@ -206,6 +206,36 @@ impl Plane {
         self.samples.widen_into(0..self.width * self.height, &mut out);
         out
     }
+
+    /// The `width x height` window at `(left, top)` as `i32`, read as rows of
+    /// the flat raster (`crate::extract_window`'s crop).
+    pub(crate) fn crop(&self, left: usize, top: usize, width: usize, height: usize) -> Result<Vec<i32>> {
+        let mut out = Vec::with_capacity(width * height);
+        for y in top..top + height {
+            let start = y * self.width + left;
+            self.samples.widen_into(start..start + width, &mut out).ok_or(HeifError::MalformedBox("clap: plane crop out of bounds"))?;
+        }
+        Ok(out)
+    }
+
+    /// Copies `dst.len()` samples of the flat raster from `(x, y)` on, as
+    /// `u16`. Nothing is copied past the end of the plane.
+    pub(crate) fn copy_row(&self, x: usize, y: usize, dst: &mut [u16]) {
+        let start = y * self.width + x;
+        let range = start..start + dst.len();
+        match &self.samples {
+            Samples::Narrow(samples) => {
+                if let Some(src) = samples.get(range) {
+                    dst.iter_mut().zip(src).for_each(|(d, &s)| *d = u16::from(s));
+                }
+            }
+            Samples::Wide(samples) => {
+                if let Some(src) = samples.get(range) {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+    }
 }
 
 /// One CTB's worth of parsed SAO parameters (clause 7.3.8.3), per
