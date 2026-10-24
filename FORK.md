@@ -17,6 +17,13 @@ fork has no reason to exist.
 | Compact sample planes (`u8`/`u16`), pooled tile pictures, SAO by CTB row: memory nearly flat across threads | `perf/compact-planes` | not yet offered; built on this fork's `main` |
 | Inverse transforms as partial butterflies, bounded by the coded coefficients (−2.5 to −17 % cycles) | `perf/butterfly-transforms` | not yet offered; built on this fork's `main` |
 | `decode_rgb8`: tiles decoded ahead on the pool, output rows written in parallel, rows through `Matrix::row` (4 threads ~2× faster) | `perf/tile-pipeline` | not yet offered; built on this fork's `main` |
+| Deblocking filters a segment's four lines at once, rows read as slices (−1.2 % cycles) | `perf/deblock-lanes` | not yet offered; built on this fork's `main` |
+| `decode_rgb8`: a rotated picture's output rows gathered with one loop each (−7.9 % cycles on rotated iPhone photos) | `perf/turned-scatter` | not yet offered; built on this fork's `main` |
+| Intra prediction row by row, border read once (−1.7 % cycles) | `perf/intra-rows` | not yet offered; built on this fork's `main` |
+
+Cycle figures: one thread on a P-core, the 10 sample photos, `perf stat`
+in pairs of alternating order against the `main` before the change; every
+change is bit-identical on 353 files (conformance, fuzz seeds, photos).
 
 Each branch is upstream `a1afbf4` plus that change alone, and passes
 `cargo test` and the conformance tests on its own. CI
