@@ -17,7 +17,7 @@ use super::params::{Pps, Sps};
 use super::residual::decode_residual;
 use super::scaling::{ScalingListData, ScalingWeights};
 use super::slice::InterSlice;
-use super::transform::{Dequant, chroma_qp_mapping, inverse_dct_dc, inverse_transform_within, transform_skip_residual};
+use super::transform::{Dequant, chroma_qp_mapping, inverse_dct_dc, inverse_transform_within, transform_reads, transform_skip_residual};
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
 use crate::timing::{self, Stage};
@@ -1257,19 +1257,34 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                         };
                         inverse_dct_dc(scale.apply_checked(coeffs[0], weight), bit_depth, res)?;
                     } else {
-                        // Every coefficient, zeros included: a zero level comes
-                        // out zero anyway (the rounding term is below the shift),
-                        // and a branch on it would mispredict and keep the loop
-                        // from vectorizing.
-                        match self.scaling_list {
-                            Some(weights) => {
-                                for ((o, &c), &weight) in dequantized.iter_mut().zip(coeffs.iter()).zip(weights.table(log2_size, cidx)?) {
-                                    *o = scale.apply_checked(c, weight);
+                        // Only what the transform reads: the coefficients up to
+                        // the last coded row and column (rounded up), zeros
+                        // included. A zero level comes out zero anyway (the
+                        // rounding term is below the shift), and a branch on it
+                        // would mispredict and keep the loop from vectorizing.
+                        let (columns, rows) = if transform_skip { (nt, nt) } else { transform_reads(nt, bounds) };
+                        let weights = match self.scaling_list {
+                            Some(weights) => Some(weights.table(log2_size, cidx)?),
+                            None => None,
+                        };
+                        // Whole rows are one run of coefficients (always for 4x4).
+                        let (run, runs) = if columns == nt { (rows * nt, 1) } else { (columns, rows) };
+                        for y in 0..runs {
+                            let at = y * nt..y * nt + run;
+                            let (Some(dst), Some(src)) = (dequantized.get_mut(at.clone()), coeffs.get(at.clone())) else {
+                                return Err(HeifError::MalformedHevc("dequant: block out of range"));
+                            };
+                            match weights {
+                                Some(table) => {
+                                    let weights = table.get(at).ok_or(HeifError::MalformedHevc("scaling list: table too small"))?;
+                                    for ((o, &c), &weight) in dst.iter_mut().zip(src).zip(weights) {
+                                        *o = scale.apply_checked(c, weight);
+                                    }
                                 }
-                            }
-                            None => {
-                                for (o, &c) in dequantized.iter_mut().zip(coeffs.iter()) {
-                                    *o = scale.apply_checked(c, 16);
+                                None => {
+                                    for (o, &c) in dst.iter_mut().zip(src) {
+                                        *o = scale.apply_checked(c, 16);
+                                    }
                                 }
                             }
                         }
