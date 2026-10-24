@@ -17,7 +17,7 @@ use super::params::{Pps, Sps};
 use super::residual::decode_residual;
 use super::scaling::{ScalingListData, ScalingWeights};
 use super::slice::InterSlice;
-use super::transform::{Dequant, chroma_qp_mapping, inverse_dct_dc, inverse_transform, transform_skip_residual};
+use super::transform::{Dequant, chroma_qp_mapping, inverse_dct_dc, inverse_transform_within, transform_skip_residual};
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
 use crate::timing::{self, Stage};
@@ -1276,7 +1276,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                         if transform_skip {
                             transform_skip_residual(dequantized, nt, bit_depth, res)?;
                         } else {
-                            inverse_transform(dequantized, nt, bit_depth, use_dst, res)?;
+                            inverse_transform_within(dequantized, nt, bit_depth, use_dst, bounds, res)?;
                         }
                     }
                 }

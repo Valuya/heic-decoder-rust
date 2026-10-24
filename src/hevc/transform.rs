@@ -3,6 +3,10 @@
 //! it, per the spec's transform-nesting property) and the 4x4 DST-VII
 //! used for luma intra 4x4 blocks.
 //!
+//! The DCT runs as partial butterflies (as in HM), on the box of a
+//! block's nonzero coefficients only; the tests check it against the
+//! direct matrix products, bit for bit.
+//!
 //! The matrices and two-pass shift/rounding structure here were checked
 //! against `libde265`'s `fallback-dct.cc` (LGPL-3.0) rather than typed
 //! from memory, given how easy a single wrong entry in a 32x32 table
@@ -138,32 +142,29 @@ pub fn transform_skip_residual(coeffs: &[i32], nt: usize, bit_depth: u32, out: &
     Ok(())
 }
 
-/// 4x4 DST-VII integer basis used for luma intra 4x4 (clause 8.6.4.1).
-const MAT_DST_4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
-
 fn log2_usize(n: usize) -> u32 {
     n.trailing_zeros()
 }
 
-/// The `n`-point DCT-II basis: rows `0, 32/n, 2*32/n, ...` of [`MAT_DCT`], first `n` columns.
-const fn dct_matrix<const N: usize>() -> [[i32; N]; N] {
-    let mut m = [[0; N]; N];
-    let mut j = 0;
-    while j < N {
+/// The odd basis functions `1, 3, 5, ...` of the `2 * H`-point DCT-II over
+/// its first `H` samples (the rest follow by antisymmetry), as `i16` so
+/// that products with 16-bit coefficients can use 16-bit multiplies.
+const fn odd_basis<const H: usize>() -> [[i16; H]; H] {
+    let mut m = [[0; H]; H];
+    let mut t = 0;
+    while t < H {
         let mut i = 0;
-        while i < N {
-            m[j][i] = MAT_DCT[32 / N * j][i];
+        while i < H {
+            m[t][i] = MAT_DCT[16 / H * (2 * t + 1)][i] as i16;
             i += 1;
         }
-        j += 1;
+        t += 1;
     }
     m
 }
 
-const MAT_DCT_4: [[i32; 4]; 4] = dct_matrix();
-const MAT_DCT_8: [[i32; 8]; 8] = dct_matrix();
-const MAT_DCT_16: [[i32; 16]; 16] = dct_matrix();
-const MAT_DCT_32: [[i32; 32]; 32] = dct_matrix();
+const ODD_16: [[i16; 8]; 8] = odd_basis();
+const ODD_32: [[i16; 16]; 16] = odd_basis();
 
 /// `Clip3(coeffMin, coeffMax, v)` with the 16-bit coefficient range (clause 8.6.4.2).
 fn clip_coeff(v: i32) -> i32 {
@@ -190,6 +191,21 @@ impl CoeffBox {
     }
 }
 
+/// The columns and rows of an `nt x nt` block that
+/// [`inverse_transform_within`] reads for coefficients in `bounds`: the
+/// rows up to the last nonzero one, and the columns up to the last nonzero
+/// one rounded up to what the vertical pass handles at once. Everything
+/// else may hold garbage.
+pub fn transform_reads(nt: usize, bounds: CoeffBox) -> (usize, usize) {
+    if nt <= 4 {
+        return (nt, nt);
+    }
+    let width = bounds.width.clamp(1, nt);
+    // The 32-point transform reads one column at a time, the others the
+    // first 4, 8 or 16 columns at once.
+    (if nt == 32 { width } else { width.next_power_of_two().max(4) }, bounds.height.clamp(1, nt))
+}
+
 /// Inverse transform for an `nT x nT` block of dequantized coefficients
 /// (row-major, `coeffs[y*nT+x]`), producing the spatial residual
 /// (row-major `i32`). `use_dst` selects the 4x4 DST-VII (luma intra 4x4
@@ -199,17 +215,40 @@ pub fn inverse_transform(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: boo
     if coeffs.len() != nt * nt || out.len() != nt * nt {
         return Err(HeifError::MalformedHevc("inverse_transform: coefficient buffer size mismatch"));
     }
+    // Both stages take inputs clipped to 16 bits (dequantization already
+    // guarantees it for decoded blocks).
+    let mut clipped = [0i32; 32 * 32];
+    let clipped = clipped.get_mut(..nt * nt).ok_or(HeifError::Unsupported("inverse_transform: size must be 4/8/16/32"))?;
+    for (c, &v) in clipped.iter_mut().zip(coeffs) {
+        *c = clip_coeff(v);
+    }
+    inverse_transform_within(clipped, nt, bit_depth, use_dst, CoeffBox::full(nt), out)
+}
+
+/// [`inverse_transform`] of a block whose nonzero coefficients all lie in
+/// `bounds`, reading only the coefficients [`transform_reads`] names: the
+/// others may hold anything. The result is the full transform's, sample
+/// for sample. The coefficients must be within 16 bits, as dequantization
+/// clips them.
+pub fn inverse_transform_within(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool, bounds: CoeffBox, out: &mut [i32]) -> Result<()> {
+    if coeffs.len() != nt * nt || out.len() != nt * nt {
+        return Err(HeifError::MalformedHevc("inverse_transform: coefficient buffer size mismatch"));
+    }
     let bd_shift = match 20u32.checked_sub(bit_depth) {
         Some(shift) if shift >= 1 => shift,
         _ => return Err(HeifError::Unsupported("inverse_transform: bit depth too high")),
     };
-    match (nt, use_dst) {
-        (4, true) => two_stage(coeffs, &MAT_DST_4, bd_shift, out),
-        (_, true) => return Err(HeifError::MalformedHevc("inverse_transform: DST-VII only valid for 4x4")),
-        (4, false) => two_stage(coeffs, &MAT_DCT_4, bd_shift, out),
-        (8, false) => two_stage(coeffs, &MAT_DCT_8, bd_shift, out),
-        (16, false) => two_stage(coeffs, &MAT_DCT_16, bd_shift, out),
-        (32, false) => two_stage(coeffs, &MAT_DCT_32, bd_shift, out),
+    let (columns, _) = transform_reads(nt, bounds);
+    match (nt, use_dst, columns) {
+        (4, true, _) => two_stage::<Dst4, 4, 4>(coeffs, bounds, bd_shift, out),
+        (_, true, _) => return Err(HeifError::MalformedHevc("inverse_transform: DST-VII only valid for 4x4")),
+        (4, false, _) => two_stage::<Dct4, 4, 4>(coeffs, bounds, bd_shift, out),
+        (8, false, 4) => two_stage::<Dct8, 8, 4>(coeffs, bounds, bd_shift, out),
+        (8, false, _) => two_stage::<Dct8, 8, 8>(coeffs, bounds, bd_shift, out),
+        (16, false, 4) => two_stage::<Dct16, 16, 4>(coeffs, bounds, bd_shift, out),
+        (16, false, 8) => two_stage::<Dct16, 16, 8>(coeffs, bounds, bd_shift, out),
+        (16, false, _) => two_stage::<Dct16, 16, 16>(coeffs, bounds, bd_shift, out),
+        (32, false, _) => two_stage_by_lines::<Dct32, 32>(coeffs, bounds, bd_shift, out),
         _ => return Err(HeifError::Unsupported("inverse_transform: size must be 4/8/16/32")),
     }
     Ok(())
@@ -230,53 +269,235 @@ pub fn inverse_dct_dc(dc: i32, bit_depth: u32, out: &mut [i32]) -> Result<()> {
     Ok(())
 }
 
-/// The separable two-stage transform of clause 8.6.4.2 with basis `m`
-/// (`m[j][i]`: basis function `j` at sample `i`). `coeffs` and `out` hold
-/// exactly `N * N` values.
+/// One `N`-point inverse transform of `L` independent inputs side by side:
+/// `out[i][l] = sum_t m[t][i] * x[t * pitch][l]`, where the rows past the
+/// end of `x` are zero, and so are the rows `t >= n` (`n` only saves work).
 ///
-/// Everything fits `i32`: both stages take inputs clipped to 16 bits (the
-/// input here too, which dequantization already guarantees), and a sum of
-/// 32 products of a 16-bit value with a basis entry of at most 90 stays
-/// below 2^27. The loops run over whole fixed-size rows, so the compiler
-/// can vectorise them; all-zero coefficient rows, most of a typical
-/// block, are skipped.
-fn two_stage<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, out: &mut [i32]) {
-    // Stage 1 (vertical): g[i][c] = sum_j m[j][i] * d[j][c], accumulated
-    // one coefficient row j at a time so the inner loop runs along c.
-    let mut g = [[0i32; N]; N];
-    for (row, basis) in coeffs.as_chunks::<N>().0.iter().zip(m) {
-        // Small blocks: computing a zero row costs less than the
-        // mispredicted branch that would skip it.
-        if N >= 16 && row.iter().all(|&d| d == 0) {
-            continue;
-        }
-        let d = row.map(clip_coeff);
-        for (g_row, &weight) in g.iter_mut().zip(basis) {
-            for (acc, &dc) in g_row.iter_mut().zip(&d) {
-                *acc += weight * dc;
+/// The DCT kernels are partial butterflies: basis function `t` is
+/// symmetric about the middle of the block for even `t` and
+/// antisymmetric for odd `t`, so outputs `i` and `N - 1 - i` share the
+/// even rows' sum `E[i]` (the `N / 2`-point transform of those rows) and
+/// the odd rows' sum `O[i]` with opposite signs: `E[i] + O[i]` and
+/// `E[i] - O[i]`. That only regroups the same integer products, so the
+/// result is exactly the matrix product's; nothing overflows `i32` (see
+/// [`two_stage`]).
+trait Kernel<const N: usize> {
+    fn apply<T: Sample, const L: usize>(x: &[[T; L]], pitch: usize, n: usize, out: &mut [[i32; L]; N]);
+}
+
+/// A transform input: a dequantized coefficient, or an intermediate value
+/// between the two stages, kept as `i16` so that the compiler can multiply
+/// with 16-bit instructions.
+trait Sample: Copy + Default + Into<i32> {}
+
+impl Sample for i16 {}
+
+impl Sample for i32 {}
+
+/// Row `t` of `x` as `i32`, zeros past its end.
+#[inline(always)]
+fn row<T: Sample, const L: usize>(x: &[[T; L]], t: usize) -> [i32; L] {
+    x.get(t).copied().unwrap_or([T::default(); L]).map(Into::into)
+}
+
+/// The 4-point DCT of the rows `0, step, 2 * step, 3 * step` of `x`: rows
+/// 0 and 2 of its basis are `64 * (1, 1, 1, 1)` and `64 * (1, -1, -1, 1)`,
+/// rows 1 and 3 `(83, 36, -36, -83)` and `(36, -83, 83, -36)`.
+#[inline(always)]
+#[allow(clippy::needless_range_loop)] // one lane of eight arrays
+fn dct4<T: Sample, const L: usize>(x: &[[T; L]], step: usize) -> [[i32; L]; 4] {
+    let [s0, s1, s2, s3] = [0, 1, 2, 3].map(|t| row(x, t * step));
+    let mut out = [[0; L]; 4];
+    for l in 0..L {
+        let (e0, e1) = (64 * (s0[l] + s2[l]), 64 * (s0[l] - s2[l]));
+        let (o0, o1) = (83 * s1[l] + 36 * s3[l], 36 * s1[l] - 83 * s3[l]);
+        out[0][l] = e0 + o0;
+        out[1][l] = e1 + o1;
+        out[2][l] = e1 - o1;
+        out[3][l] = e0 - o0;
+    }
+    out
+}
+
+/// The odd half of the 8-point DCT of the rows `0, step, 2 * step, ...`
+/// of `x`: its basis functions 1, 3, 5 and 7 over the first four samples.
+#[inline(always)]
+#[allow(clippy::needless_range_loop)] // one lane of eight arrays
+fn dct8_odd<T: Sample, const L: usize>(x: &[[T; L]], step: usize) -> [[i32; L]; 4] {
+    let [s1, s3, s5, s7] = [1, 3, 5, 7].map(|t| row(x, t * step));
+    let mut o = [[0; L]; 4];
+    for l in 0..L {
+        o[0][l] = 89 * s1[l] + 75 * s3[l] + 50 * s5[l] + 18 * s7[l];
+        o[1][l] = 75 * s1[l] - 18 * s3[l] - 89 * s5[l] - 50 * s7[l];
+        o[2][l] = 50 * s1[l] - 89 * s3[l] + 18 * s5[l] + 75 * s7[l];
+        o[3][l] = 18 * s1[l] - 50 * s3[l] + 75 * s5[l] - 89 * s7[l];
+    }
+    o
+}
+
+/// The odd part of a `2 * H`-point DCT with odd basis functions `m` (see
+/// [`odd_basis`]) on the rows `0, step, 2 * step, ...` of `x`, the first
+/// `n` of them: `o[i] = sum m[t][i] * x[(2 * t + 1) * step]` for `i < H`.
+#[inline(always)]
+fn odd_part<T: Sample, const L: usize, const H: usize>(m: &[[i16; H]; H], x: &[[T; L]], step: usize, n: usize) -> [[i32; L]; H] {
+    let mut o = [[0i32; L]; H];
+    // A loop over the rows present, without an exit per row, so the
+    // compiler keeps it a loop and vectorises its body.
+    for (basis, row) in m.iter().zip(x.iter().step_by(step).take(n).skip(1).step_by(2)) {
+        for (acc, &weight) in o.iter_mut().zip(basis) {
+            for (a, &v) in acc.iter_mut().zip(row) {
+                *a += i32::from(weight) * v.into();
             }
         }
     }
-    for g_row in &mut g {
-        for v in g_row.iter_mut() {
-            *v = clip_coeff((*v + 64) >> 7);
+    o
+}
+
+/// `out = [e[0] + o[0], ..., e[H-1] + o[H-1], e[H-1] - o[H-1], ..., e[0] - o[0]]`.
+#[inline(always)]
+fn butterfly<const L: usize>(e: &[[i32; L]], o: &[[i32; L]], out: &mut [[i32; L]]) {
+    let (low, high) = out.split_at_mut(e.len());
+    for (((low, high), e), o) in low.iter_mut().zip(high.iter_mut().rev()).zip(e).zip(o) {
+        for (((low, high), &e), &o) in low.iter_mut().zip(high.iter_mut()).zip(e).zip(o) {
+            let sum = e + o;
+            *low = sum;
+            // Rather than `e - o`: the compiler (LLVM 22, plain x86-64)
+            // vectorises neither half when both are computed from `e` and `o`.
+            *high = sum - 2 * o;
+        }
+    }
+}
+
+/// The 4-point DST-VII, written out with HM's shared terms.
+struct Dst4;
+
+impl Kernel<4> for Dst4 {
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop)] // one lane of eight arrays
+    fn apply<T: Sample, const L: usize>(x: &[[T; L]], pitch: usize, _: usize, out: &mut [[i32; L]; 4]) {
+        let [s0, s1, s2, s3] = [0, 1, 2, 3].map(|t| row(x, t * pitch));
+        for l in 0..L {
+            let (c0, c1, c2, c3) = (s0[l] + s2[l], s2[l] + s3[l], s0[l] - s3[l], 74 * s1[l]);
+            out[0][l] = 29 * c0 + 55 * c1 + c3;
+            out[1][l] = 55 * c2 - 29 * c1 + c3;
+            out[2][l] = 74 * (s0[l] - s2[l] + s3[l]);
+            out[3][l] = 55 * c0 + 29 * c2 - c3;
+        }
+    }
+}
+
+struct Dct4;
+
+impl Kernel<4> for Dct4 {
+    #[inline(always)]
+    fn apply<T: Sample, const L: usize>(x: &[[T; L]], pitch: usize, _: usize, out: &mut [[i32; L]; 4]) {
+        *out = dct4(x, pitch);
+    }
+}
+
+/// The 8-point DCT: the 4-point one on the even rows, and the odd half.
+struct Dct8;
+
+impl Kernel<8> for Dct8 {
+    #[inline(always)]
+    fn apply<T: Sample, const L: usize>(x: &[[T; L]], pitch: usize, _: usize, out: &mut [[i32; L]; 8]) {
+        butterfly(&dct4(x, 2 * pitch), &dct8_odd(x, pitch), out);
+    }
+}
+
+/// The 16-point DCT: the 8-point one on the even rows, the odd rows from the basis.
+struct Dct16;
+
+impl Kernel<16> for Dct16 {
+    #[inline(always)]
+    fn apply<T: Sample, const L: usize>(x: &[[T; L]], pitch: usize, n: usize, out: &mut [[i32; L]; 16]) {
+        let mut even = [[0; L]; 8];
+        butterfly(&dct4(x, 4 * pitch), &dct8_odd(x, 2 * pitch), &mut even);
+        butterfly(&even, &odd_part(&ODD_16, x, pitch, n), out);
+    }
+}
+
+/// The 32-point DCT: the 16-point one on the even rows, the odd rows from the basis.
+struct Dct32;
+
+impl Kernel<32> for Dct32 {
+    #[inline(always)]
+    fn apply<T: Sample, const L: usize>(x: &[[T; L]], pitch: usize, n: usize, out: &mut [[i32; L]; 32]) {
+        let (mut even8, mut even16) = ([[0; L]; 8], [[0; L]; 16]);
+        butterfly(&dct4(x, 8 * pitch), &dct8_odd(x, 4 * pitch), &mut even8);
+        butterfly(&even8, &odd_part(&ODD_16, x, 2 * pitch, n.div_ceil(2)), &mut even16);
+        butterfly(&even16, &odd_part(&ODD_32, x, pitch, n), out);
+    }
+}
+
+/// The separable two-stage transform of clause 8.6.4.2 with kernel `K`,
+/// for coefficients inside `bounds`: stage 1 on `L` columns side by side,
+/// stage 2 one row at a time with its outputs side by side. `coeffs` and
+/// `out` hold exactly `N * N` values; only the first `bounds.height` rows
+/// (all of them for `N == 4`) of the first `L` columns of `coeffs` are
+/// read, `L` at least `bounds.width`.
+///
+/// Everything fits `i32`: both stages take inputs clipped to 16 bits, and
+/// a sum of 32 products of a 16-bit value with a basis entry of at most
+/// 90 stays below 2^27, as does any partial sum of it.
+fn two_stage<K: Kernel<N>, const N: usize, const L: usize>(coeffs: &[i32], bounds: CoeffBox, bd_shift: u32, out: &mut [i32]) {
+    // Stage 1 (vertical): coefficient row t starts at chunk t * N / L, and
+    // the rows past the box are left out. Columns past `bounds.width` come
+    // out zero, so stage 2 skips them.
+    let rows = if N == 4 { N } else { bounds.height };
+    let x = coeffs.get(..rows * N).unwrap_or(coeffs).as_chunks::<L>().0;
+    let mut sums = [[0i32; L]; N];
+    K::apply(x, N / L, rows, &mut sums);
+    let mut g = [[0i16; L]; N];
+    for (g, &v) in g.as_flattened_mut().iter_mut().zip(sums.as_flattened()) {
+        *g = clip_coeff((v + 64) >> 7) as i16;
+    }
+
+    // Stage 2 (horizontal), one row at a time, straight into `out`.
+    let rnd = 1i32 << (bd_shift - 1);
+    for (dst, g_row) in out.as_chunks_mut::<N>().0.iter_mut().zip(&g) {
+        if let Ok(dst) = <&mut [[i32; 1]; N]>::try_from(dst.as_chunks_mut::<1>().0) {
+            K::apply(g_row.as_chunks::<1>().0, 1, bounds.width, dst);
+        }
+        for o in dst.iter_mut() {
+            *o = (*o + rnd) >> bd_shift;
+        }
+    }
+}
+
+/// [`two_stage`] one line at a time in both stages: each column, then
+/// each row, with its `N` outputs side by side. For the 32-point DCT, whose
+/// columns side by side would not fit in registers. Reads only the
+/// coefficients inside `bounds`.
+fn two_stage_by_lines<K: Kernel<N>, const N: usize>(coeffs: &[i32], bounds: CoeffBox, bd_shift: u32, out: &mut [i32]) {
+    let (width, height) = (bounds.width.min(N), bounds.height.min(N));
+    // Stage 1 (vertical): column c of the intermediate block, kept as row c.
+    let mut columns = [[0i16; N]; N];
+    for (c, column) in columns.iter_mut().enumerate().take(width) {
+        let mut x = [[0i16; 1]; N];
+        for (x, &v) in x.iter_mut().zip(coeffs.iter().skip(c).step_by(N)).take(height) {
+            *x = [v as i16];
+        }
+        let mut sums = [[0i32; 1]; N];
+        K::apply(&x, 1, height, &mut sums);
+        for (g, [v]) in column.iter_mut().zip(sums) {
+            *g = clip_coeff((v + 64) >> 7) as i16;
         }
     }
 
-    // Stage 2 (horizontal): out[y][i] = sum_j m[j][i] * g[y][j].
+    // Stage 2 (horizontal): row y of the intermediate block is entry y of
+    // the first `width` columns.
     let rnd = 1i32 << (bd_shift - 1);
-    for (dst, g_row) in out.as_chunks_mut::<N>().0.iter_mut().zip(&g) {
-        let mut acc = [0i32; N];
-        for (&gj, basis) in g_row.iter().zip(m) {
-            if N >= 16 && gj == 0 {
-                continue;
-            }
-            for (a, &weight) in acc.iter_mut().zip(basis) {
-                *a += weight * gj;
-            }
+    for (y, dst) in out.as_chunks_mut::<N>().0.iter_mut().enumerate() {
+        let mut x = [[0i16; 1]; N];
+        for (x, column) in x.iter_mut().zip(&columns).take(width) {
+            *x = [column.get(y).copied().unwrap_or(0)];
         }
-        for (o, a) in dst.iter_mut().zip(acc) {
-            *o = (a + rnd) >> bd_shift;
+        if let Ok(dst) = <&mut [[i32; 1]; N]>::try_from(dst.as_chunks_mut::<1>().0) {
+            K::apply(&x, 1, width, dst);
+        }
+        for o in dst.iter_mut() {
+            *o = (*o + rnd) >> bd_shift;
         }
     }
 }
@@ -284,6 +505,192 @@ fn two_stage<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 4x4 DST-VII integer basis used for luma intra 4x4 (clause 8.6.4.1).
+    const MAT_DST_4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+
+    /// The `n`-point DCT-II basis: rows `0, 32/n, 2*32/n, ...` of [`MAT_DCT`], first `n` columns.
+    const fn dct_matrix<const N: usize>() -> [[i32; N]; N] {
+        let mut m = [[0; N]; N];
+        let mut j = 0;
+        while j < N {
+            let mut i = 0;
+            while i < N {
+                m[j][i] = MAT_DCT[32 / N * j][i];
+                i += 1;
+            }
+            j += 1;
+        }
+        m
+    }
+
+    const MAT_DCT_4: [[i32; 4]; 4] = dct_matrix();
+    const MAT_DCT_8: [[i32; 8]; 8] = dct_matrix();
+    const MAT_DCT_16: [[i32; 16]; 16] = dct_matrix();
+    const MAT_DCT_32: [[i32; 32]; 32] = dct_matrix();
+
+    /// The transform as it was before the butterflies: the direct matrix
+    /// products, kept to check the new one against, bit for bit.
+    ///
+    /// The separable two-stage transform of clause 8.6.4.2 with basis `m`
+    /// (`m[j][i]`: basis function `j` at sample `i`). `coeffs` and `out` hold
+    /// exactly `N * N` values.
+    ///
+    /// Everything fits `i32`: both stages take inputs clipped to 16 bits (the
+    /// input here too, which dequantization already guarantees), and a sum of
+    /// 32 products of a 16-bit value with a basis entry of at most 90 stays
+    /// below 2^27. The loops run over whole fixed-size rows, so the compiler
+    /// can vectorise them; all-zero coefficient rows, most of a typical
+    /// block, are skipped.
+    fn two_stage_matrix<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, out: &mut [i32]) {
+        // Stage 1 (vertical): g[i][c] = sum_j m[j][i] * d[j][c], accumulated
+        // one coefficient row j at a time so the inner loop runs along c.
+        let mut g = [[0i32; N]; N];
+        for (row, basis) in coeffs.as_chunks::<N>().0.iter().zip(m) {
+            // Small blocks: computing a zero row costs less than the
+            // mispredicted branch that would skip it.
+            if N >= 16 && row.iter().all(|&d| d == 0) {
+                continue;
+            }
+            let d = row.map(clip_coeff);
+            for (g_row, &weight) in g.iter_mut().zip(basis) {
+                for (acc, &dc) in g_row.iter_mut().zip(&d) {
+                    *acc += weight * dc;
+                }
+            }
+        }
+        for g_row in &mut g {
+            for v in g_row.iter_mut() {
+                *v = clip_coeff((*v + 64) >> 7);
+            }
+        }
+
+        // Stage 2 (horizontal): out[y][i] = sum_j m[j][i] * g[y][j].
+        let rnd = 1i32 << (bd_shift - 1);
+        for (dst, g_row) in out.as_chunks_mut::<N>().0.iter_mut().zip(&g) {
+            let mut acc = [0i32; N];
+            for (&gj, basis) in g_row.iter().zip(m) {
+                if N >= 16 && gj == 0 {
+                    continue;
+                }
+                for (a, &weight) in acc.iter_mut().zip(basis) {
+                    *a += weight * gj;
+                }
+            }
+            for (o, a) in dst.iter_mut().zip(acc) {
+                *o = (a + rnd) >> bd_shift;
+            }
+        }
+    }
+
+    /// [`two_stage_matrix`] on a whole block.
+    fn matrix_transform(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool) -> Vec<i32> {
+        let mut out = vec![99; nt * nt];
+        let shift = 20 - bit_depth;
+        match (nt, use_dst) {
+            (4, true) => two_stage_matrix(coeffs, &MAT_DST_4, shift, &mut out),
+            (4, false) => two_stage_matrix(coeffs, &MAT_DCT_4, shift, &mut out),
+            (8, false) => two_stage_matrix(coeffs, &MAT_DCT_8, shift, &mut out),
+            (16, false) => two_stage_matrix(coeffs, &MAT_DCT_16, shift, &mut out),
+            (32, false) => two_stage_matrix(coeffs, &MAT_DCT_32, shift, &mut out),
+            _ => panic!("no such transform"),
+        }
+        out
+    }
+
+    #[test]
+    fn the_butterflies_give_the_matrix_products_bit_for_bit() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut blocks = 0;
+        for (nt, use_dst) in [(4, true), (4, false), (8, false), (16, false), (32, false)] {
+            for bit_depth in 8..=16 {
+                for round in 0..400 {
+                    // The nonzero coefficients' box: anything from the DC
+                    // alone to the whole block, then some lopsided ones.
+                    let (width, height) = match round % 4 {
+                        0 => (1 + next() as usize % nt, 1 + next() as usize % nt),
+                        1 => (1 + next() as usize % 4.min(nt), 1 + next() as usize % nt),
+                        2 => (1 + next() as usize % nt, 1 + next() as usize % 4.min(nt)),
+                        _ => (nt, nt),
+                    };
+                    let bounds = CoeffBox { width, height };
+                    // Sparse, dense, extreme, small: values the decoder can
+                    // produce, 16-bit, with the corner of the box set so
+                    // the box is tight.
+                    let density = [1, 2, 4, 64][next() as usize % 4];
+                    let mut coeffs = vec![0i32; nt * nt];
+                    for y in 0..height {
+                        for x in 0..width {
+                            if next() % density == 0 || (x + 1, y + 1) == (width, height) {
+                                coeffs[y * nt + x] = match next() % 6 {
+                                    0 => 32767,
+                                    1 => -32768,
+                                    2 => (next() % 65536) as i32 - 32768,
+                                    3 => (next() % 33) as i32 - 16,
+                                    4 => (next() % 2049) as i32 - 1024,
+                                    _ => [1, -1][next() as usize % 2],
+                                };
+                            }
+                        }
+                    }
+                    let expected = matrix_transform(&coeffs, nt, bit_depth, use_dst);
+                    assert_eq!(idct(&coeffs, nt, bit_depth, use_dst).unwrap(), expected, "nt={nt} dst={use_dst} bd={bit_depth} {bounds:?}");
+
+                    // The bounded transform must not read past what it says
+                    // it reads: garbage everywhere else, as in reused scratch.
+                    let (columns, rows) = transform_reads(nt, bounds);
+                    let mut scratch: Vec<i32> = (0..nt * nt).map(|_| next() as i32).collect();
+                    for y in 0..rows {
+                        for x in 0..columns {
+                            scratch[y * nt + x] = coeffs[y * nt + x];
+                        }
+                    }
+                    let mut out = vec![99; nt * nt];
+                    inverse_transform_within(&scratch, nt, bit_depth, use_dst, bounds, &mut out).unwrap();
+                    assert_eq!(out, expected, "within: nt={nt} dst={use_dst} bd={bit_depth} {bounds:?}");
+                    blocks += 1;
+                }
+            }
+        }
+        assert_eq!(blocks, 5 * 9 * 400);
+    }
+
+    #[test]
+    fn out_of_range_coefficients_are_clipped_as_before() {
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (nt, use_dst) in [(4, true), (4, false), (8, false), (16, false), (32, false)] {
+            for bit_depth in [8, 12, 16] {
+                for _ in 0..50 {
+                    let coeffs: Vec<i32> = (0..nt * nt).map(|_| [32768, -32769, i32::MAX, i32::MIN, 0, next() as i32][next() as usize % 6]).collect();
+                    assert_eq!(idct(&coeffs, nt, bit_depth, use_dst).unwrap(), matrix_transform(&coeffs, nt, bit_depth, use_dst));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_read_region_covers_the_box() {
+        for nt in [4, 8, 16, 32] {
+            for width in 1..=nt {
+                for height in 1..=nt {
+                    let (columns, rows) = transform_reads(nt, CoeffBox { width, height });
+                    assert!(columns >= width && rows >= height && columns <= nt && rows <= nt);
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_zero_level_dequantizes_to_zero_whatever_the_parameters() {
