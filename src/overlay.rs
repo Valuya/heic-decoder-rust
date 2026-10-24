@@ -154,9 +154,9 @@ pub(crate) fn compose(parsed: &ParsedHeif, transform: bool, rgb: &RgbOptions) ->
                 target.copy_from_slice(source);
                 return;
             }
-            for (out, px) in target.chunks_exact_mut(3).zip(source.chunks_exact(4)) {
-                let a = u32::from(px[3]).min(max);
-                for (o, &c) in out.iter_mut().zip(&px[..3]) {
+            for (out, &[r, g, b, a]) in target.as_chunks_mut::<3>().0.iter_mut().zip(source.as_chunks::<4>().0) {
+                let a = u32::from(a).min(max);
+                for (o, c) in out.iter_mut().zip([r, g, b]) {
                     *o = ((u32::from(c) * a + u32::from(*o) * (max - a)) / max) as u16;
                 }
             }
