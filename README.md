@@ -88,6 +88,7 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 - `alpha`: `AlphaMode::Ignore` (the default, as `to_rgb8` does; the alpha image is then not decoded at all) or `AlphaMode::Over([r, g, b])`, which composites over a background using alpha as `to_rgba8` scales it.
 - `rgb`: the same `RgbOptions` as `to_rgb8_with_options`.
 - `max_picture_pixels`, `max_total_pixels`: limits on every coded picture, at its uncropped SPS size, and on a grid's canvas and the sum of its tiles. They are checked before anything is allocated, because a failed allocation aborts the process.
+- `reuse_chroma_rows` (default `true`): interpolate each chroma row once for all the output rows that read it, instead of once per output row. The pixels are the same either way. It applies to pictures that are not turned by a 90° rotation, and makes decoding them about 9% faster on one core (6 sample photos, user-space cycles); turned pictures take the per-row path regardless. Turn it off to compare, or to rule it out.
 
 The time is within a few percent of `decode` + `to_rgb8`. A file that doesn't stream (a predicted image, a grid with uneven or odd-sized tiles, an overlay) goes through `decode` instead, under the same limits and with the same result. `tests/rgb_decode.rs` checks the equality on every bundled fixture, and on every Nokia conformance file with `--ignored`.
 

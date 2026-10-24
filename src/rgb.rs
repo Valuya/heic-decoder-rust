@@ -61,6 +61,10 @@ pub struct DecodeRgbOptions {
     pub max_picture_pixels: u64,
     /// Largest grid: the assembled canvas, and the sum of its tiles.
     pub max_total_pixels: u64,
+    /// Interpolate each chroma row once for the output rows that share it,
+    /// instead of once per output row. Same pixels either way; it only
+    /// applies to pictures that are not turned by a 90° rotation.
+    pub reuse_chroma_rows: bool,
 }
 
 impl Default for DecodeRgbOptions {
@@ -71,6 +75,7 @@ impl Default for DecodeRgbOptions {
             rgb: RgbOptions::default(),
             max_picture_pixels: MAX_IMAGE_PIXELS,
             max_total_pixels: MAX_IMAGE_PIXELS,
+            reuse_chroma_rows: REUSE_CHROMA_ROWS,
         }
     }
 }
@@ -832,6 +837,13 @@ fn decode_tile(image: &ResolvedImage, pool: &PicturePool) -> Result<Tile> {
 /// Rows converted per parallel batch.
 const ROWS_PER_BATCH: usize = 64;
 
+/// Consecutive rows one task converts: neighbouring rows read the same
+/// chroma rows, which the task then interpolates only once.
+const ROWS_PER_TASK: usize = 8;
+
+/// [`DecodeRgbOptions::reuse_chroma_rows`] by default.
+const REUSE_CHROMA_ROWS: bool = true;
+
 /// Stream-decodes `parsed` to RGB, or `None` when the file needs `decode`'s
 /// general path.
 fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Option<RgbImage<u8>>> {
@@ -1050,8 +1062,19 @@ fn convert(
         }
         for batch in (next_y..ready).step_by(ROWS_PER_BATCH) {
             let batch_end = (batch + ROWS_PER_BATCH).min(ready);
-            let converted: Vec<Vec<[u8; 3]>> =
-                (batch..batch_end).into_par_iter().map(|y| convert_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, turned, &pixel)).collect();
+            let converted: Vec<Vec<[u8; 3]>> = if turned || !options.reuse_chroma_rows {
+                // A turned picture's rows share no interpolated chroma.
+                (batch..batch_end).into_par_iter().map(|y| convert_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, turned, &pixel)).collect()
+            } else {
+                let tasks: Vec<usize> = (batch..batch_end).step_by(ROWS_PER_TASK).collect();
+                tasks
+                    .into_par_iter()
+                    .flat_map_iter(|start| {
+                        let mut rows = RowConverter::new(&luma, &cb, &cr, &column_arrays, &rows_axis, &pixel);
+                        (start..(start + ROWS_PER_TASK).min(batch_end)).map(move |y| rows.convert(y))
+                    })
+                    .collect()
+            };
             sink.put_batch(&scatter, batch, &converted, alpha.as_ref());
         }
         next_y = ready;
@@ -1078,6 +1101,68 @@ impl Columns {
     fn new(axis: &SourceAxis) -> Self {
         let get = |f: fn(&Entry) -> usize| axis.entries.iter().map(|e| e.as_ref().map_or(0, f)).collect();
         Columns { lo: get(|e| e.lo), hi: get(|e| e.hi), weight: axis.entries.iter().map(|e| e.map_or(0.0, |e| e.weight)).collect() }
+    }
+}
+
+/// A chroma row interpolated along the columns: its index, Cb and Cr.
+type Along = Option<(usize, Vec<f32>, Vec<f32>)>;
+
+/// Source rows through the converter's arithmetic, laid out by rows: the
+/// same expressions as `ChromaRows::slot`/`blend` and `Matrix::row`,
+/// evaluated once per value. Every index comes from the geometry, not the
+/// data, and lies inside the rows held; a miss would read 0, not panic.
+/// Consecutive rows share the chroma rows they interpolate and the buffers.
+struct RowConverter<'a> {
+    luma: &'a Rows,
+    cb: &'a Rows,
+    cr: &'a Rows,
+    columns: &'a Columns,
+    rows: &'a SourceAxis,
+    pixel: &'a PixelRgb,
+    /// Chroma rows interpolated along the columns, Cb and Cr, by chroma row
+    /// index.
+    along: [Along; 2],
+    cb_row: Vec<f32>,
+    cr_row: Vec<f32>,
+    luma_row: Vec<i32>,
+}
+
+impl<'a> RowConverter<'a> {
+    fn new(luma: &'a Rows, cb: &'a Rows, cr: &'a Rows, columns: &'a Columns, rows: &'a SourceAxis, pixel: &'a PixelRgb) -> Self {
+        RowConverter { luma, cb, cr, columns, rows, pixel, along: [None, None], cb_row: Vec::new(), cr_row: Vec::new(), luma_row: Vec::new() }
+    }
+
+    /// Source row `y`, converted.
+    fn convert(&mut self, y: usize) -> Vec<[u8; 3]> {
+        let samples = self.luma.get(y);
+        let Some(ry) = self.rows.entries[y] else { return Vec::new() };
+        let mut out = vec![[0u8; 3]; samples.len()];
+        let pixel = self.pixel;
+        if pixel.monochrome() {
+            for (o, &s) in out.iter_mut().zip(samples) {
+                *o = pixel.rgb8(i32::from(s), 0.0, 0.0);
+            }
+            return out;
+        }
+        let columns = self.columns;
+        let (cb_row, cr_row) = (&mut self.cb_row, &mut self.cr_row);
+        cb_row.clear();
+        cr_row.clear();
+        // Each chroma row interpolated to this row's width once, then blended
+        // for every pixel of the row; then the row through the planar
+        // converter's own matrix loop.
+        let lo = along(&mut self.along, ry.lo, ry.hi, self.cb, self.cr, columns);
+        let hi = along(&mut self.along, ry.hi, ry.lo, self.cb, self.cr, columns);
+        let (top, bottom) = (self.along[lo].as_ref().map(|a| (&a.1, &a.2)), self.along[hi].as_ref().map(|a| (&a.1, &a.2)));
+        if let (Some((cb_top, cr_top)), Some((cb_bottom, cr_bottom))) = (top, bottom) {
+            let blend = |t: &[f32], b: &[f32], to: &mut Vec<f32>| to.extend(t.iter().zip(b).map(|(&t, &b)| PixelRgb::lerp_rows(t, b, ry.weight)));
+            blend(cb_top, cb_bottom, cb_row);
+            blend(cr_top, cr_bottom, cr_row);
+        }
+        self.luma_row.clear();
+        self.luma_row.extend(samples.iter().map(|&s| i32::from(s)));
+        pixel.row8(&mut out, &self.luma_row, cb_row, cr_row);
+        out
     }
 }
 
@@ -1124,6 +1209,39 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
     let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
     pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
     out
+}
+
+/// A chroma sample as `i32`, 0 past the row's end.
+fn at(row: &[u16], i: usize) -> i32 {
+    i32::from(row.get(i).copied().unwrap_or(0))
+}
+
+/// The slot of `slots` holding chroma row `index` interpolated along the
+/// columns. A missing row replaces one other than `keep`, the row the same
+/// output row also reads, and otherwise the lower one.
+fn along(slots: &mut [Along; 2], index: usize, keep: usize, cb: &Rows, cr: &Rows, columns: &Columns) -> usize {
+    if let Some(slot) = slots.iter().position(|s| s.as_ref().is_some_and(|s| s.0 == index)) {
+        return slot;
+    }
+    let key = |slot: &Along| slot.as_ref().map(|s| s.0);
+    let slot = match (key(&slots[0]), key(&slots[1])) {
+        (None, _) => 0,
+        (_, None) => 1,
+        (Some(a), _) if a == keep && index != keep => 1,
+        (_, Some(b)) if b == keep && index != keep => 0,
+        (Some(a), Some(b)) => usize::from(b < a),
+    };
+    let (_, cb_along, cr_along) = slots[slot].get_or_insert_with(|| (index, Vec::new(), Vec::new()));
+    let interpolate = |row: &[u16], to: &mut Vec<f32>| {
+        to.clear();
+        to.extend(columns.lo.iter().zip(&columns.hi).zip(&columns.weight).map(|((&lo, &hi), &w)| PixelRgb::lerp_samples(at(row, lo), at(row, hi), w)));
+    };
+    interpolate(cb.get(index), cb_along);
+    interpolate(cr.get(index), cr_along);
+    if let Some(s) = slots[slot].as_mut() {
+        s.0 = index;
+    }
+    slot
 }
 
 #[cfg(test)]
