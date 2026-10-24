@@ -13,6 +13,7 @@ fork has no reason to exist.
 | Read unlabelled colour as BT.601, as libheif does | `feat/bt601-for-unlabelled-colour` | [#2](https://github.com/Multipad-cyber/heic-decoder-rust/pull/2) |
 | `decode_rgb8` / `decode_rgb8_with`: RGB bit-identical to `decode` + `to_rgb8` without the planar picture, optionally downscaled (12 MP: 151 → 53 MB full size, 35 MB at 1568 px) | `feat/decode-rgb8-fit` | [#3](https://github.com/Multipad-cyber/heic-decoder-rust/pull/3) |
 | Branch-free CABAC decision and batched bypass bins (−16 to −26 % cycles, bit-identical) | `perf/branch-free-entropy-decoding` | [#4](https://github.com/Multipad-cyber/heic-decoder-rust/pull/4) |
+| Overlay (`iovl`) images, composed in RGB as libheif composes them | `feat/overlay-images` | not yet offered; built on this fork's `main` |
 
 Each branch is upstream `a1afbf4` plus that change alone, and passes
 `cargo test` and the conformance tests on its own. CI
