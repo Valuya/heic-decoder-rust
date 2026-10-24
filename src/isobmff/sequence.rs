@@ -243,6 +243,7 @@ pub(super) fn parse(file: &[u8], moov: &[u8]) -> Result<ParsedHeif> {
         reference_image: None,
         primary_item_id: track_id,
         grid: None,
+        overlay: None,
         transforms,
         metadata,
         images: vec![ResolvedImage { hevc_config, data }],
