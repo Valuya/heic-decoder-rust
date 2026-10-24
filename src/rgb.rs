@@ -5,7 +5,9 @@
 //! 12 MP iPhone photo, 3.5 GB for 200 MP. [`decode_rgb8`] decodes a grid one
 //! row of tiles at a time and converts each source row as soon as the chroma
 //! rows it reads are decoded, then lets them go. Its output is bit-identical
-//! to `decode(..)?.to_rgb8_with_options(..)`: the container's crop, rotation
+//! to `decode(..)?.to_rgb8_with_options(..)` (but for an overlay, whose inputs
+//! are converted with the options before they are composed, where `decode`
+//! composes them with the defaults): the container's crop, rotation
 //! and mirroring are resolved into per-axis index maps with the same chroma
 //! geometry [`crate::decode`] would produce, and every pixel goes through the
 //! same arithmetic, in the same order, as the planar converter.
@@ -14,7 +16,7 @@
 //! smaller image as they are produced, so only the output is ever held.
 //!
 //! Files this does not stream — a predicted image, a grid with uneven or
-//! odd-sized tiles, an alpha plane to composite — go through
+//! odd-sized tiles, an alpha plane to composite, an overlay — go through
 //! [`crate::decode`] instead, under the same limits.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -22,12 +24,13 @@ use std::sync::mpsc;
 
 use rayon::prelude::*;
 
-use crate::color::{Axis, ChromaSampling, PixelRgb, RgbImage, RgbOptions, alpha8, axis};
+use crate::color::{Axis, ChromaSampling, ColorInfo, PixelRgb, RgbImage, RgbOptions, alpha8, axis};
 use crate::error::{HeifError, Result};
+use crate::hevc::ctu::Picture;
 use crate::hevc::nal::NAL_SPS;
 use crate::hevc::params::parse_sps;
 use crate::isobmff::{self, ResolvedImage, Transform};
-use crate::{DecodedImage, MAX_IMAGE_PIXELS, chroma_subsampling, crop_axis, decode_one_image, find_and_parse, image_from_picture};
+use crate::{ImageWindow, MAX_IMAGE_PIXELS, PicturePool, chroma_subsampling, conformance_window, crop_axis, decode_into, find_and_parse};
 
 /// What to do with an alpha plane.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,6 +53,7 @@ pub struct DecodeRgbOptions {
     pub max_edge: Option<usize>,
     pub alpha: AlphaMode,
     /// Colour override and chroma upsampling, as for `to_rgb8_with_options`.
+    /// An overlay's inputs are converted with them before they are composed.
     pub rgb: RgbOptions,
     /// Largest coded picture (one grid tile, or a whole non-grid image with
     /// its alpha and prediction reference), in luma samples as the SPS
@@ -115,6 +119,10 @@ pub fn decode_rgb8_with(bytes: &[u8], options: &DecodeRgbOptions) -> Result<RgbI
         return Err(too_large());
     }
 
+    if let Some(overlay) = &parsed.overlay {
+        crate::overlay::check_limits(overlay, options.max_picture_pixels, options.max_total_pixels)?;
+        return through_decode(bytes, options);
+    }
     if parsed.reference_image.is_some() {
         let mut pixels = tile_pixels.iter().sum::<u64>();
         if let Some(image) = &parsed.reference_image {
@@ -138,14 +146,14 @@ fn picture_pixels(image: &ResolvedImage) -> Result<u64> {
 
 /// `decode` and the planar converter, for the files [`stream`] leaves out.
 fn through_decode(bytes: &[u8], options: &DecodeRgbOptions) -> Result<RgbImage<u8>> {
-    let image = crate::decode(bytes)?;
+    let (image, rgb_options) = crate::decode_for_rgb(bytes, &options.rgb)?;
     let rgb = match options.alpha {
         AlphaMode::Over(background) if image.alpha.is_some() => {
-            let rgba = image.to_rgba8_with_options(&options.rgb)?;
+            let rgba = image.to_rgba8_with_options(&rgb_options)?;
             let data = rgba.data.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, a]| over([r, g, b], a, background)).collect();
             RgbImage { width: rgba.width, height: rgba.height, data }
         }
-        _ => image.to_rgb8_with_options(&options.rgb)?,
+        _ => image.to_rgb8_with_options(&rgb_options)?,
     };
     drop(image);
     let full = (rgb.width, rgb.height);
@@ -702,16 +710,16 @@ struct TileShape {
     bit_depth_chroma: u32,
 }
 
-impl TileShape {
-    fn of(tile: &DecodedImage) -> Self {
-        TileShape {
-            width: tile.width,
-            height: tile.height,
-            format: tile.chroma_format_idc,
-            bit_depth_luma: tile.bit_depth_luma,
-            bit_depth_chroma: tile.bit_depth_chroma,
-        }
-    }
+/// A decoded tile: its picture as decoded, and where in it the image
+/// `decode` would crop it to lies.
+struct Tile {
+    pic: Picture,
+    shape: TileShape,
+    /// Luma origin of the SPS conformance window.
+    left: usize,
+    top: usize,
+    sampling: ChromaSampling,
+    color_info: Option<ColorInfo>,
 }
 
 /// One row of tiles laid out as source rows, as `blit_tiles` places them on
@@ -741,21 +749,22 @@ impl Layout {
         Band { luma: vec![vec![0; self.width]; rows], cb: vec![vec![0; self.cb_width]; c_rows], cr: vec![vec![0; self.cb_width]; c_rows] }
     }
 
-    /// Copies the tile in column `column` into `band`.
-    fn place(&self, band: &mut Band, column: usize, tile: &DecodedImage) {
+    /// Copies the tile in column `column` into `band`, straight from the
+    /// decoded picture's planes.
+    fn place(&self, band: &mut Band, column: usize, tile: &Tile) {
         let x0 = column * self.tile.width;
         let w = self.tile.width.min(self.width.saturating_sub(x0));
         if w == 0 {
             return;
         }
-        let narrow = |dst: &mut [u16], src: &[i32]| dst.iter_mut().zip(src).for_each(|(d, &s)| *d = s as u16);
         for (r, row) in band.luma.iter_mut().enumerate() {
-            narrow(&mut row[x0..x0 + w], &tile.y[r * tile.width..][..w]);
+            tile.pic.y.copy_row(tile.left, tile.top + r, &mut row[x0..x0 + w]);
         }
         let (cx, cw) = (x0 / self.sub_w, w.div_ceil(self.sub_w));
+        let (left, top) = (tile.left / self.sub_w, tile.top / self.sub_h);
         for (r, (row_cb, row_cr)) in band.cb.iter_mut().zip(band.cr.iter_mut()).enumerate() {
-            narrow(&mut row_cb[cx..cx + cw], &tile.cb[r * tile.cb_width..][..cw]);
-            narrow(&mut row_cr[cx..cx + cw], &tile.cr[r * tile.cb_width..][..cw]);
+            tile.pic.cb.copy_row(left, top + r, &mut row_cb[cx..cx + cw]);
+            tile.pic.cr.copy_row(left, top + r, &mut row_cr[cx..cx + cw]);
         }
     }
 }
@@ -784,8 +793,22 @@ impl Rows {
     }
 }
 
-fn decode_tile(image: &ResolvedImage) -> Result<DecodedImage> {
-    decode_one_image(image).and_then(|(sps, pic)| image_from_picture(&sps, pic))
+/// Decodes a tile into a picture from `pool`, and resolves the crop `decode`
+/// would make (failing as it would).
+fn decode_tile(image: &ResolvedImage, pool: &PicturePool) -> Result<Tile> {
+    let (sps, pic) = decode_into(image, None, pool.take())?;
+    let format = sps.chroma_format_idc;
+    let mut sampling = ChromaSampling::coded(format, sps.chroma_location);
+    let window = conformance_window(&sps)?;
+    let ImageWindow { left, top, width, height } =
+        window.unwrap_or(ImageWindow { left: 0, top: 0, width: sps.pic_width_in_luma_samples as usize, height: sps.pic_height_in_luma_samples as usize });
+    if window.is_some() {
+        let (sub_w, sub_h) = chroma_subsampling(format);
+        sampling.origin_x -= (left % sub_w) as f32;
+        sampling.origin_y -= (top % sub_h) as f32;
+    }
+    let shape = TileShape { width, height, format, bit_depth_luma: sps.bit_depth_luma, bit_depth_chroma: sps.bit_depth_chroma };
+    Ok(Tile { pic, shape, left, top, sampling, color_info: sps.color_info })
 }
 
 /// Rows converted per parallel batch.
@@ -805,19 +828,22 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
         None => return Ok(None),
     };
     let images = &parsed.images;
+    // Each thread decodes its tiles into the pictures of the tiles placed
+    // before them.
+    let pool = PicturePool::default();
     // Called from inside rayon's pool, blocking on a channel could starve
     // a one-thread pool; with one thread, a decoder thread beside the
-    // caller only adds switching. Decode a row at a time there.
+    // caller only adds switching. Decode a few tiles at a time there.
     if rayon::current_thread_index().is_some() || rayon::current_num_threads() == 1 || images.len() == 1 {
         let threads = rayon::current_num_threads();
-        return convert(parsed, options, columns, rows, &mut Chunked { images, threads, pending: BTreeMap::new() });
+        return convert(parsed, options, columns, rows, &pool, &mut Chunked { images, pool: &pool, threads, pending: BTreeMap::new() });
     }
     rayon::in_place_scope(|scope| {
         let (sender, receiver) = mpsc::channel();
         let window = TILES_AHEAD_PER_THREAD * rayon::current_num_threads();
-        let mut feed = Ahead { scope, images, window, sender, receiver, spawned: 0, pending: BTreeMap::new() };
+        let mut feed = Ahead { scope, images, pool: &pool, window, sender, receiver, spawned: 0, pending: BTreeMap::new() };
         feed.spawn_until(window);
-        convert(parsed, options, columns, rows, &mut feed)
+        convert(parsed, options, columns, rows, &pool, &mut feed)
     })
 }
 
@@ -828,7 +854,7 @@ const TILES_AHEAD_PER_THREAD: usize = 2;
 
 /// Where [`convert`] gets its decoded tiles, in raster order.
 trait Tiles {
-    fn tile(&mut self, index: usize) -> Result<DecodedImage>;
+    fn tile(&mut self, index: usize) -> Result<Tile>;
 }
 
 /// Tiles decoded on rayon's pool, a window of them beyond the one being
@@ -837,12 +863,13 @@ trait Tiles {
 struct Ahead<'s, 'p> {
     scope: &'s rayon::Scope<'p>,
     images: &'p [ResolvedImage],
+    pool: &'p PicturePool,
     window: usize,
-    sender: mpsc::Sender<(usize, Result<DecodedImage>)>,
-    receiver: mpsc::Receiver<(usize, Result<DecodedImage>)>,
+    sender: mpsc::Sender<(usize, Result<Tile>)>,
+    receiver: mpsc::Receiver<(usize, Result<Tile>)>,
     spawned: usize,
     /// Tiles that arrived before their turn.
-    pending: BTreeMap<usize, Result<DecodedImage>>,
+    pending: BTreeMap<usize, Result<Tile>>,
 }
 
 impl<'p> Ahead<'_, 'p> {
@@ -850,10 +877,10 @@ impl<'p> Ahead<'_, 'p> {
     fn spawn_until(&mut self, end: usize) {
         let end = end.min(self.images.len());
         while self.spawned < end {
-            let (index, image, sender) = (self.spawned, &self.images[self.spawned], self.sender.clone());
+            let (index, image, pool, sender) = (self.spawned, &self.images[self.spawned], self.pool, self.sender.clone());
             self.scope.spawn(move |_| {
                 // The receiver is gone only if the caller already failed.
-                let _ = sender.send((index, decode_tile(image)));
+                let _ = sender.send((index, decode_tile(image, pool)));
             });
             self.spawned += 1;
         }
@@ -861,7 +888,7 @@ impl<'p> Ahead<'_, 'p> {
 }
 
 impl Tiles for Ahead<'_, '_> {
-    fn tile(&mut self, index: usize) -> Result<DecodedImage> {
+    fn tile(&mut self, index: usize) -> Result<Tile> {
         self.spawn_until(index + 1 + self.window);
         loop {
             if let Some(tile) = self.pending.remove(&index) {
@@ -877,17 +904,19 @@ impl Tiles for Ahead<'_, '_> {
 /// thread, or when the caller is itself on rayon's pool.
 struct Chunked<'p> {
     images: &'p [ResolvedImage],
+    pool: &'p PicturePool,
     threads: usize,
-    pending: BTreeMap<usize, DecodedImage>,
+    pending: BTreeMap<usize, Tile>,
 }
 
 impl Tiles for Chunked<'_> {
-    fn tile(&mut self, index: usize) -> Result<DecodedImage> {
+    fn tile(&mut self, index: usize) -> Result<Tile> {
         if let Some(tile) = self.pending.remove(&index) {
             return Ok(tile);
         }
         let end = (index + self.threads.max(1)).min(self.images.len());
-        let decoded: Vec<DecodedImage> = self.images[index..end].par_iter().map(decode_tile).collect::<Result<_>>()?;
+        let pool = self.pool;
+        let decoded: Vec<Tile> = self.images[index..end].par_iter().map(|image| decode_tile(image, pool)).collect::<Result<_>>()?;
         let mut decoded = decoded.into_iter();
         let first = decoded.next().ok_or(HeifError::MalformedBox("grid has no tiles"))?;
         self.pending.extend((index + 1..end).zip(decoded));
@@ -895,14 +924,22 @@ impl Tiles for Chunked<'_> {
     }
 }
 
-/// [`stream`]'s conversion, fed tiles in raster order by `tiles`.
-fn convert(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions, columns: usize, rows: usize, tiles: &mut dyn Tiles) -> Result<Option<RgbImage<u8>>> {
+/// [`stream`]'s conversion, fed tiles in raster order by `tiles`; their
+/// pictures go back to `pool` once placed.
+fn convert(
+    parsed: &isobmff::ParsedHeif,
+    options: &DecodeRgbOptions,
+    columns: usize,
+    rows: usize,
+    pool: &PicturePool,
+    tiles: &mut dyn Tiles,
+) -> Result<Option<RgbImage<u8>>> {
     // The first tile tells the layout; it is placed like the others.
     let first = tiles.tile(0)?;
-    let shape = TileShape::of(&first);
+    let shape = first.shape;
     let (width, height) = match parsed.grid {
         Some(grid) => (grid.output_width as usize, grid.output_height as usize),
-        None => (first.width, first.height),
+        None => (shape.width, shape.height),
     };
     let (sub_w, sub_h) = chroma_subsampling(shape.format);
     // Tiles on chroma boundaries stack into whole chroma rows, as the grid
@@ -911,7 +948,7 @@ fn convert(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions, columns: us
         return Ok(None);
     }
     let (cb_width, cb_height) = if shape.format == 0 { (0, 0) } else { (width.div_ceil(sub_w), height.div_ceil(sub_h)) };
-    let g = geometry(width, height, cb_width, cb_height, shape.format, first.chroma_sampling, &parsed.transforms)?;
+    let g = geometry(width, height, cb_width, cb_height, shape.format, first.sampling, &parsed.transforms)?;
     if !converter_accepts(&g, shape.format) {
         return Ok(None);
     }
@@ -973,7 +1010,7 @@ fn convert(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions, columns: us
                 Some(tile) => tile,
                 None => tiles.tile(band_index * columns + column)?,
             };
-            let s = TileShape::of(&tile);
+            let s = tile.shape;
             if (s.format, s.bit_depth_luma, s.bit_depth_chroma) != (shape.format, shape.bit_depth_luma, shape.bit_depth_chroma) {
                 return Err(HeifError::Unsupported("decode: grid tiles with inconsistent bit depth/chroma format are not supported"));
             }
@@ -981,6 +1018,7 @@ fn convert(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions, columns: us
                 return Ok(None);
             }
             layout.place(&mut band, column, &tile);
+            pool.give(tile.pic);
         }
         luma.rows.extend(band.luma);
         cb.rows.extend(band.cb);

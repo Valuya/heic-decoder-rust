@@ -1,6 +1,6 @@
 # heic-decoder
 
-> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request. They fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8` (RGB bit-identical to `decode` + `to_rgb8` at a third of the memory, optionally downscaled), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists them with their PRs. The rest of this README is upstream's.
+> **This is Valuya's fork** of [Multipad-cyber/heic-decoder-rust](https://github.com/Multipad-cyber/heic-decoder-rust): upstream plus four changes that are each open upstream as a pull request, and overlay images. The four fix `C034.heic`, read unlabelled colour as BT.601, add `decode_rgb8` (RGB bit-identical to `decode` + `to_rgb8` at a third of the memory, optionally downscaled), and speed up entropy decoding by 16–26%. [FORK.md](FORK.md) lists the changes with their PRs. The rest of this README is upstream's.
 
 A pure-Rust HEIF/HEIC still-image decoder. Opens the photos your iPhone takes — no C libraries, no `unsafe`, no system codecs.
 
@@ -61,6 +61,7 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 - Monochrome and 4:2:0, 4:2:2 and 4:4:4 chroma; 4:2:2 checked at 8, 10 and 12 bits
 - SPS conformance-window cropping, rotation, mirroring and clean-aperture cropping (`irot`, `imir`, `clap`)
 - Derived identity (`iden`) images
+- Derived overlay (`iovl`) images, composed in RGB as libheif composes them ([Overlays](#overlays))
 - First frame of HEIF image sequences
 - P-pictures predicted from a single IDR reference
 - ICC profile, EXIF and XMP extraction
@@ -69,7 +70,7 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 - Optional RGB8/RGB16 and RGBA8/RGBA16 conversion with file matrix/range information and chroma upsampling
 - Safe on untrusted input: malformed files return an error instead of crashing, and pictures above 268 megapixels (`MAX_IMAGE_PIXELS`) are refused before anything is allocated
 
-`decode` returns monochrome or planar YCbCr at the coded bit depth, with an optional native alpha plane. It does no RGB conversion. Rotation preserves native chroma samples: rotated 4:2:2 can have full-width, half-height chroma, so use `cb_width` and `cb_height` for output plane dimensions. The `decode_file` example writes samples above 8 bits as little-endian `u16`.
+`decode` returns monochrome or planar YCbCr at the coded bit depth, with an optional native alpha plane. It does no RGB conversion, except for an overlay, which is composed in RGB (see [Overlays](#overlays)). Rotation preserves native chroma samples: rotated 4:2:2 can have full-width, half-height chroma, so use `cb_width` and `cb_height` for output plane dimensions. The `decode_file` example writes samples above 8 bits as little-endian `u16`.
 
 ## Decoding straight to RGB
 
@@ -88,7 +89,7 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 - `rgb`: the same `RgbOptions` as `to_rgb8_with_options`.
 - `max_picture_pixels`, `max_total_pixels`: limits on every coded picture, at its uncropped SPS size, and on a grid's canvas and the sum of its tiles. They are checked before anything is allocated, because a failed allocation aborts the process.
 
-The time is within a few percent of `decode` + `to_rgb8`. A file that doesn't stream (a predicted image, a grid with uneven or odd-sized tiles) goes through `decode` instead, under the same limits and with the same result. `tests/rgb_decode.rs` checks the equality on every bundled fixture, and on every Nokia conformance file with `--ignored`.
+The time is within a few percent of `decode` + `to_rgb8`. A file that doesn't stream (a predicted image, a grid with uneven or odd-sized tiles, an overlay) goes through `decode` instead, under the same limits and with the same result. `tests/rgb_decode.rs` checks the equality on every bundled fixture, and on every Nokia conformance file with `--ignored`.
 
 ## Optional RGB conversion
 
@@ -101,6 +102,18 @@ Bilinear chroma reconstruction is the default. `image.to_rgb8_with_options(&RgbO
 RGB output retains the source primaries and transfer function. Apply the source ICC profile or appropriate color management when displaying it; this conversion does not assume sRGB, linearise pixels or tone-map HDR. The PPM example does not embed ICC metadata.
 
 The conversion computes in floats. Every RGB8 value is the correctly rounded result, and every RGB16 value is within 0.51 of exact. heic-rs uses integer arithmetic instead; [Accuracy compared with heic-rs](#accuracy-compared-with-heic-rs) shows what that costs.
+
+## Overlays
+
+An overlay (`iovl`, ISO/IEC 23008-12 clause 6.6.2.2) places its input images, coded or grid, each with its own alpha and transforms, at signed offsets on a canvas filled with one colour. Its fill colour is RGB, so libheif composes in RGB, and this decoder does the same, step for step:
+
+- The canvas is RGB 4:4:4 at the first input's bit depth (at least 8), filled with `canvas_fill_value` reduced to that depth by dropping its low bits. It has no alpha: the fill's alpha is unused.
+- Each input is converted to RGB at the canvas depth and drawn in reference order, clipped to the canvas: copied, or blended by its alpha as `(input × a + canvas × (max − a)) / max`, truncated. An input deeper than the first is refused, as libheif refuses it.
+- The overlay's own `clap`/`irot`/`imir` then apply to the composed picture.
+
+`decode` returns the result as 4:4:4 coded with the identity matrix (`color_info.matrix_coefficients == 0`, full range): green in `y`, blue in `cb`, red in `cr`, so `to_rgb8` gives back exactly the composed RGB, and `probe` reports `chroma_format_idc` 3 at the canvas depth. Primaries and transfer come from the overlay's `colr`, else its inputs'. `decode` converts the inputs with the default `RgbOptions`; `decode_rgb8_with` converts them with its `rgb` options (colour override, chroma upsampling) instead, so for an overlay it differs from `decode` + `to_rgb8_with_options` when those are not the defaults. A colour override passed to `to_rgb*` would replace the identity matrix and is not meaningful for an overlay. `DecodeOptions { apply_transforms: false }` leaves both the inputs and the overlay untransformed, as libheif's `ignore_transformations` does. The limits of `decode_rgb8_with` bound the canvas, every input's coded pictures, and all the pixels the placements decode, before anything is decoded.
+
+Composed from the same inputs, the result is the same as libheif's, pixel for pixel: on the Nokia conformance overlays C015–C021 and on Nokia's `overlay_1000x680.heic` and `alpha.heic` (an input with alpha), libheif 1.23.6's overlay equals its own inputs composed this way, and this decoder's overlay equals its own inputs composed this way. Any difference from libheif's RGB is that of the inputs' YCbCr-to-RGB conversion, the same as when the inputs are decoded on their own.
 
 ## Transparency
 
@@ -128,6 +141,7 @@ tile matches HM.
 - PCM
 - Advanced Range Extensions tools such as RDPCM, persistent Rice adaptation, transform-skip rotation, disabled intra smoothing and cross-component prediction; streams that enable them return an `Unsupported` error
 - Auxiliary depth maps and HDR gain maps; alpha attached separately to individual colour-grid tiles; resizing alpha to a different display resolution
+- Overlays nested in overlays, or used as alpha planes; overlay inputs deeper than the first input
 
 ## Comparison with heic-rs
 

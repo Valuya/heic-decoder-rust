@@ -9,6 +9,8 @@
 //! [`DecodedImage::to_rgb16`] when the caller needs interleaved RGB.
 //! Auxiliary alpha is returned in [`DecodedImage::alpha`]; use
 //! [`DecodedImage::to_rgba8`] or [`DecodedImage::to_rgba16`] to retain it.
+//! Overlay (`iovl`) images are composed in RGB, as libheif composes them, and
+//! returned as 4:4:4 coded with the identity matrix.
 //!
 //! ```no_run
 //! let data = std::fs::read("photo.heic")?;
@@ -42,6 +44,7 @@ pub mod isobmff;
 #[cfg(not(feature = "internals"))]
 #[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
 mod isobmff;
+mod overlay;
 mod rgb;
 #[cfg(feature = "timing")]
 #[doc(hidden)]
@@ -83,6 +86,8 @@ pub struct AlphaPlane {
 
 /// A decoded still image: monochrome or planar YCbCr (4:2:0, 4:2:2 or 4:4:4),
 /// `bit_depth` bits per sample, values in `0 ..= (1<<bit_depth)-1`.
+/// A composed overlay is RGB 4:4:4 coded with the identity matrix
+/// (`color_info.matrix_coefficients == 0`, full range): G, B, R in `y`, `cb`, `cr`.
 /// RGB/RGBA conversion is optional via the `to_rgb*`/`to_rgba*` methods.
 /// Clean-aperture output retains native samples: the chroma origin is the
 /// cell containing the final luma crop origin, with ceil-divided extents.
@@ -129,15 +134,30 @@ fn find_and_parse<T>(nalus: impl Iterator<Item = impl AsRef<[u8]>>, expected_typ
 /// Unstable: only with the `internals` feature.
 #[cfg(feature = "internals")]
 pub fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
-    decode_with_reference(image, None)
+    decode_into(image, None, Picture::empty())
 }
 
-#[cfg(not(feature = "internals"))]
-fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
-    decode_with_reference(image, None)
+/// Pictures kept for their buffers: a grid's tiles are decoded into them in
+/// turn, on whichever thread, instead of each allocating its own.
+#[derive(Default)]
+struct PicturePool(std::sync::Mutex<Vec<Picture>>);
+
+impl PicturePool {
+    /// A picture to [`decode_into`], recycled if one is free.
+    fn take(&self) -> Picture {
+        self.0.lock().ok().and_then(|mut free| free.pop()).unwrap_or_else(Picture::empty)
+    }
+
+    /// Hands a picture's buffers to the next tile.
+    fn give(&self, pic: Picture) {
+        if let Ok(mut free) = self.0.lock() {
+            free.push(pic);
+        }
+    }
 }
 
-fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> Result<(Sps, Picture)> {
+/// Decodes `image` into `pic`'s buffers, which it resets first.
+fn decode_into(image: &ResolvedImage, reference: Option<&Picture>, mut pic: Picture) -> Result<(Sps, Picture)> {
     let setup = timing::start(Stage::Headers);
     let sps: Sps = find_and_parse(image.hevc_config.nalus_of_type(NAL_SPS), NAL_SPS, parse_sps)?;
     let pps: Pps = find_and_parse(image.hevc_config.nalus_of_type(NAL_PPS), NAL_PPS, parse_pps)?;
@@ -157,7 +177,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
 
     let sub_w = if sps.chroma_format_idc == 0 { 0 } else { sps.sub_width_c() as usize };
     let sub_h = if sps.chroma_format_idc == 0 { 0 } else { sps.sub_height_c() as usize };
-    let mut pic = Picture::new(
+    pic.reset(
         sps.pic_width_in_luma_samples as usize,
         sps.pic_height_in_luma_samples as usize,
         sub_w,
@@ -291,44 +311,72 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     Ok((sps, pic))
 }
 
-fn image_from_picture(sps: &Sps, pic: Picture) -> Result<DecodedImage> {
-    let _timer = timing::start(Stage::Pack);
-    let cb_width = pic.cb.width;
-    let cb_height = pic.cb.height;
-    let image = DecodedImage {
-        alpha: None,
-        width: sps.pic_width_in_luma_samples as usize,
-        height: sps.pic_height_in_luma_samples as usize,
-        bit_depth_luma: sps.bit_depth_luma,
-        bit_depth_chroma: sps.bit_depth_chroma,
-        chroma_format_idc: sps.chroma_format_idc,
-        color_info: sps.color_info,
-        chroma_sampling: ChromaSampling::coded(sps.chroma_format_idc, sps.chroma_location),
-        y: pic.y.into_samples(),
-        cb: pic.cb.into_samples(),
-        cr: pic.cr.into_samples(),
-        cb_width,
-        cb_height,
-        metadata: isobmff::Metadata::default(),
-    };
+/// The SPS conformance window, when it crops anything.
+fn conformance_window(sps: &Sps) -> Result<Option<ImageWindow>> {
     if sps.conformance_window == [0; 4] {
-        return Ok(image);
+        return Ok(None);
     }
     let [left, right, top, bottom] = sps.conformance_window.map(|v| v as usize);
-    let width = image
-        .width
+    let width = (sps.pic_width_in_luma_samples as usize)
         .checked_sub(left)
         .and_then(|v| v.checked_sub(right))
         .filter(|&v| v != 0)
         .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
-    let height = image
-        .height
+    let height = (sps.pic_height_in_luma_samples as usize)
         .checked_sub(top)
         .and_then(|v| v.checked_sub(bottom))
         .filter(|&v| v != 0)
         .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
-    let (sub_w, sub_h) = chroma_subsampling(image.chroma_format_idc);
-    extract_window(image, ImageWindow { left, top, width, height }, sub_w, sub_h)
+    Ok(Some(ImageWindow { left, top, width, height }))
+}
+
+/// The picture's samples as `i32` planes, cropped to the SPS conformance
+/// window.
+fn image_from_picture(sps: &Sps, pic: &Picture) -> Result<DecodedImage> {
+    let _timer = timing::start(Stage::Pack);
+    let format = sps.chroma_format_idc;
+    let mut chroma_sampling = ChromaSampling::coded(format, sps.chroma_location);
+    let whole = |plane: &hevc::ctu::Plane| plane.crop(0, 0, plane.width, plane.height);
+    let (width, height, cb_width, cb_height, y, cb, cr) = match conformance_window(sps)? {
+        None => (
+            sps.pic_width_in_luma_samples as usize,
+            sps.pic_height_in_luma_samples as usize,
+            pic.cb.width,
+            pic.cb.height,
+            whole(&pic.y)?,
+            whole(&pic.cb)?,
+            whole(&pic.cr)?,
+        ),
+        // Native planar extraction: retain source samples, selecting chroma
+        // from the cell containing the final luma origin. No interpolation.
+        Some(ImageWindow { left, top, width, height }) => {
+            let (sub_w, sub_h) = chroma_subsampling(format);
+            let cb_width = if format == 0 { 0 } else { width.div_ceil(sub_w) };
+            let cb_height = if format == 0 { 0 } else { height.div_ceil(sub_h) };
+            let y = pic.y.crop(left, top, width, height)?;
+            let chroma = |plane: &hevc::ctu::Plane| if format == 0 { Ok(Vec::new()) } else { plane.crop(left / sub_w, top / sub_h, cb_width, cb_height) };
+            let (cb, cr) = (chroma(&pic.cb)?, chroma(&pic.cr)?);
+            chroma_sampling.origin_x -= (left % sub_w) as f32;
+            chroma_sampling.origin_y -= (top % sub_h) as f32;
+            (width, height, cb_width, cb_height, y, cb, cr)
+        }
+    };
+    Ok(DecodedImage {
+        alpha: None,
+        width,
+        height,
+        bit_depth_luma: sps.bit_depth_luma,
+        bit_depth_chroma: sps.bit_depth_chroma,
+        chroma_format_idc: format,
+        color_info: sps.color_info,
+        chroma_sampling,
+        y,
+        cb,
+        cr,
+        cb_width,
+        cb_height,
+        metadata: isobmff::Metadata::default(),
+    })
 }
 
 /// Copies `tile` into `canvas` at the raster position implied by
@@ -433,7 +481,10 @@ fn blit_tiles(canvas: &mut DecodedImage, tiles: &[DecodedImage], columns: u32, t
 
 /// Decodes a HEIF/HEIC file's primary image — a single `hvc1` image, or
 /// an identity-derived image, or a `grid` of `hvc1` tiles stitched into one picture (what real
-/// full-resolution iPhone photos use) — to planar YCbCr.
+/// full-resolution iPhone photos use) — to planar YCbCr. An `iovl` overlay is
+/// composed in RGB, as libheif composes it, and returned as 4:4:4 coded with
+/// the identity matrix (`matrix_coefficients` 0): green in `y`, blue in `cb`,
+/// red in `cr`, which [`DecodedImage::to_rgb8`] turns back into RGB.
 /// With no still-image metadata, selects one sync sample from an image/video
 /// sequence track. This does not implement playback, timing or edit lists.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
@@ -458,17 +509,38 @@ impl Default for DecodeOptions {
 /// [`decode`] with explicit settings.
 pub fn decode_with(bytes: &[u8], options: &DecodeOptions) -> Result<DecodedImage> {
     let mut parsed = isobmff::parse(bytes)?;
-    let metadata = std::mem::take(&mut parsed.metadata);
-    let mut image = decode_pixels(&parsed, options.apply_transforms)?;
+    let mut image = decode_item(&parsed, options.apply_transforms, &RgbOptions::default())?;
+    image.metadata = std::mem::take(&mut parsed.metadata);
+    Ok(image)
+}
+
+/// The image as [`decode`] returns it, for RGB conversion with `rgb`, and the
+/// options to convert it with: an overlay's inputs are converted with `rgb`
+/// while composing, and the composed picture is already RGB.
+pub(crate) fn decode_for_rgb(bytes: &[u8], rgb: &RgbOptions) -> Result<(DecodedImage, RgbOptions)> {
+    let parsed = isobmff::parse(bytes)?;
+    let image = decode_item(&parsed, true, rgb)?;
+    Ok((image, if parsed.overlay.is_some() { RgbOptions { color: None, ..*rgb } } else { *rgb }))
+}
+
+/// One resolved image with its alpha and effective colour description,
+/// without the file's metadata. `rgb` converts an overlay's inputs.
+pub(crate) fn decode_item(parsed: &isobmff::ParsedHeif, transform: bool, rgb: &RgbOptions) -> Result<DecodedImage> {
+    let mut image = match parsed.overlay {
+        Some(_) => overlay::compose(parsed, transform, rgb)?,
+        None => decode_pixels(parsed, transform)?,
+    };
     if let Some(auxiliary) = &parsed.alpha {
-        let alpha = decode_pixels(&auxiliary.image, options.apply_transforms)?;
+        let alpha = decode_pixels(&auxiliary.image, transform)?;
         if alpha.width != image.width || alpha.height != image.height {
             return Err(HeifError::Unsupported("alpha: display dimensions do not match colour image"));
         }
         image.alpha = Some(AlphaPlane { bit_depth: alpha.bit_depth_luma, samples: alpha.y, premultiplied: auxiliary.premultiplied });
     }
-    image.color_info = metadata.color_info.or(image.color_info);
-    image.metadata = metadata;
+    // A composed overlay is RGB whatever its `colr` says about matrix and range.
+    if parsed.overlay.is_none() {
+        image.color_info = parsed.metadata.color_info.or(image.color_info);
+    }
     Ok(image)
 }
 
@@ -479,11 +551,13 @@ pub struct ImageInfo {
     /// Size after the container's crop, rotation and mirroring.
     pub width: usize,
     pub height: usize,
-    /// Size before those transforms (after grid assembly and SPS cropping).
+    /// Size before those transforms (after grid assembly and SPS cropping, or
+    /// an overlay's canvas).
     pub coded_width: usize,
     pub coded_height: usize,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
+    /// 3 for an overlay, which [`decode`] returns as RGB 4:4:4.
     pub chroma_format_idc: u32,
     /// Bit depth of the auxiliary alpha image, if the file has one.
     pub alpha_bit_depth: Option<u32>,
@@ -493,22 +567,23 @@ pub struct ImageInfo {
 /// decoding pixels, so callers can apply their own limits first.
 pub fn probe(bytes: &[u8]) -> Result<ImageInfo> {
     let parsed = isobmff::parse(bytes)?;
-    let (coded_width, coded_height, sps) = coded_size(&parsed)?;
+    let (coded_width, coded_height, bit_depth_luma, bit_depth_chroma, chroma_format_idc) = match &parsed.overlay {
+        // Composed as RGB 4:4:4 at the canvas depth.
+        Some(overlay) => {
+            let depth = overlay::canvas_bit_depth(overlay)?;
+            (overlay.output_width as usize, overlay.output_height as usize, depth, depth, 3)
+        }
+        None => {
+            let (width, height, sps) = coded_size(&parsed)?;
+            (width, height, sps.bit_depth_luma, sps.bit_depth_chroma, sps.chroma_format_idc)
+        }
+    };
     let (width, height) = transformed_size(coded_width, coded_height, &parsed.transforms)?;
     let alpha_bit_depth = match &parsed.alpha {
         Some(auxiliary) => Some(coded_size(&auxiliary.image)?.2.bit_depth_luma),
         None => None,
     };
-    Ok(ImageInfo {
-        width,
-        height,
-        coded_width,
-        coded_height,
-        bit_depth_luma: sps.bit_depth_luma,
-        bit_depth_chroma: sps.bit_depth_chroma,
-        chroma_format_idc: sps.chroma_format_idc,
-        alpha_bit_depth,
-    })
+    Ok(ImageInfo { width, height, coded_width, coded_height, bit_depth_luma, bit_depth_chroma, chroma_format_idc, alpha_bit_depth })
 }
 
 /// Output size before container transforms, and the first image's SPS.
@@ -561,14 +636,14 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
                     return Err(HeifError::Unsupported("prediction dependency must be an IDR picture"));
                 }
             }
-            decode_one_image(image)
+            decode_into(image, None, Picture::empty())
         })
         .transpose()?;
 
     let Some(grid) = parsed.grid else {
         let image = parsed.images.first().ok_or(HeifError::MalformedBox("no image to decode"))?;
-        let (sps, pic) = decode_with_reference(image, reference.as_ref().map(|(_, pic)| pic))?;
-        return apply_transforms(image_from_picture(&sps, pic)?, transforms);
+        let (sps, pic) = decode_into(image, reference.as_ref().map(|(_, pic)| pic), Picture::empty())?;
+        return apply_transforms(image_from_picture(&sps, &pic)?, transforms);
     };
 
     if parsed.images.len() != (grid.rows as usize) * (grid.columns as usize) {
@@ -590,14 +665,18 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
 
     // Decode grid tiles in parallel using rayon
     use rayon::prelude::*;
+    let pool = PicturePool::default();
     let tiles: Vec<DecodedImage> = parsed
         .images
         .par_iter()
         .map(|image| {
-            let (sps, pic) = decode_one_image(image)?;
-            image_from_picture(&sps, pic)
+            let (sps, pic) = decode_into(image, None, pool.take())?;
+            let tile = image_from_picture(&sps, &pic);
+            pool.give(pic);
+            tile
         })
         .collect::<Result<Vec<_>>>()?;
+    drop(pool);
     let assembly = timing::start(Stage::Grid);
     let first = tiles.first().ok_or(HeifError::MalformedBox("grid has no tiles"))?;
     let (tile_width, tile_height) = (first.width, first.height);
