@@ -239,6 +239,37 @@ pub fn inverse_transform_within(coeffs: &[i32], nt: usize, bit_depth: u32, use_d
         _ => return Err(HeifError::Unsupported("inverse_transform: bit depth too high")),
     };
     let (columns, _) = transform_reads(nt, bounds);
+    // The kernels inline into this closure, which `dispatch` compiles for
+    // the widest vector instructions the CPU has.
+    SIMD.dispatch(InverseTransform { coeffs, nt, use_dst, columns, bounds, bd_shift, out })
+}
+
+/// [`inverse_transform_kernel`]'s arguments, for [`pulp::Arch::dispatch`].
+struct InverseTransform<'a> {
+    coeffs: &'a [i32],
+    nt: usize,
+    use_dst: bool,
+    columns: usize,
+    bounds: CoeffBox,
+    bd_shift: u32,
+    out: &'a mut [i32],
+}
+
+impl pulp::WithSimd for InverseTransform<'_> {
+    type Output = Result<()>;
+
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, _: S) -> Result<()> {
+        let InverseTransform { coeffs, nt, use_dst, columns, bounds, bd_shift, out } = self;
+        inverse_transform_kernel(coeffs, nt, use_dst, columns, bounds, bd_shift, out)
+    }
+}
+
+/// The SIMD level found at start, for [`inverse_transform_within`].
+static SIMD: std::sync::LazyLock<pulp::Arch> = std::sync::LazyLock::new(pulp::Arch::new);
+
+#[inline(always)]
+fn inverse_transform_kernel(coeffs: &[i32], nt: usize, use_dst: bool, columns: usize, bounds: CoeffBox, bd_shift: u32, out: &mut [i32]) -> Result<()> {
     match (nt, use_dst, columns) {
         (4, true, _) => two_stage::<Dst4, 4, 4>(coeffs, bounds, bd_shift, out),
         (_, true, _) => return Err(HeifError::MalformedHevc("inverse_transform: DST-VII only valid for 4x4")),
@@ -440,6 +471,7 @@ impl Kernel<32> for Dct32 {
 /// Everything fits `i32`: both stages take inputs clipped to 16 bits, and
 /// a sum of 32 products of a 16-bit value with a basis entry of at most
 /// 90 stays below 2^27, as does any partial sum of it.
+#[inline(always)]
 fn two_stage<K: Kernel<N>, const N: usize, const L: usize>(coeffs: &[i32], bounds: CoeffBox, bd_shift: u32, out: &mut [i32]) {
     // Stage 1 (vertical): coefficient row t starts at chunk t * N / L, and
     // the rows past the box are left out. Columns past `bounds.width` come
@@ -469,6 +501,7 @@ fn two_stage<K: Kernel<N>, const N: usize, const L: usize>(coeffs: &[i32], bound
 /// each row, with its `N` outputs side by side. For the 32-point DCT, whose
 /// columns side by side would not fit in registers. Reads only the
 /// coefficients inside `bounds`.
+#[inline(always)]
 fn two_stage_by_lines<K: Kernel<N>, const N: usize>(coeffs: &[i32], bounds: CoeffBox, bd_shift: u32, out: &mut [i32]) {
     let (width, height) = (bounds.width.min(N), bounds.height.min(N));
     // Stage 1 (vertical): column c of the intermediate block, kept as row c.
