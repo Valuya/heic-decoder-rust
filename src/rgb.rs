@@ -417,6 +417,10 @@ struct Scatter {
     /// For each transformed row: the source row (unturned) or source
     /// column (turned) it comes from.
     source_of_row: Vec<Option<usize>>,
+    /// Unturned, the source columns kept land on one run of transformed
+    /// columns: `(first source column, first transformed column, length,
+    /// reversed)`. A row then copies as one slice.
+    span: Option<(usize, usize, usize, bool)>,
 }
 
 impl Scatter {
@@ -430,7 +434,20 @@ impl Scatter {
                 source_of_row[*t] = Some(s);
             }
         }
-        Scatter { turned, row_t, col_t, source_of_row }
+        let span = Self::span(&col_t);
+        Scatter { turned, row_t, col_t, source_of_row, span }
+    }
+
+    fn span(col_t: &[Option<usize>]) -> Option<(usize, usize, usize, bool)> {
+        let start = col_t.iter().position(Option::is_some)?;
+        let len = col_t[start..].iter().take_while(|t| t.is_some()).count();
+        if col_t[start + len..].iter().any(Option::is_some) {
+            return None;
+        }
+        let ts: Vec<usize> = col_t[start..start + len].iter().flatten().copied().collect();
+        let reversed = len > 1 && ts[1] < ts[0];
+        let ok = ts.windows(2).all(|w| if reversed { w[1] + 1 == w[0] } else { w[0] + 1 == w[1] });
+        ok.then(|| (start, if reversed { ts[len - 1] } else { ts[0] }, len, reversed))
     }
 
     /// The transformed rows a batch of source rows writes to: all of them
@@ -516,6 +533,17 @@ impl Sink {
                 let row = *width * 3;
                 let touched = scatter.rows_touched(first, converted.len(), data.len() / row.max(1));
                 data[touched.start * row..touched.end * row].par_chunks_mut(row).zip(touched).for_each(|(out, ty)| {
+                    // An unturned row whose columns land on one run: a copy.
+                    if let (false, None, Some((x0, t0, len, reversed))) = (scatter.turned, alpha, scatter.span) {
+                        let Some(src) = scatter.source_of_row[ty].and_then(|y| y.checked_sub(first)).and_then(|i| converted.get(i)) else { return };
+                        let (Some(src), Some(dst)) = (src.get(x0..x0 + len), out.as_chunks_mut::<3>().0.get_mut(t0..t0 + len)) else { return };
+                        if reversed {
+                            dst.iter_mut().zip(src.iter().rev()).for_each(|(d, s)| *d = *s);
+                        } else {
+                            dst.copy_from_slice(src);
+                        }
+                        return;
+                    }
                     for (tx, rgb) in scatter.row_pixels(ty, first, converted) {
                         out[tx * 3..tx * 3 + 3].copy_from_slice(&pixel(tx, ty, rgb));
                     }
@@ -1014,7 +1042,9 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
     }
     let at = |row: &[u16], i: usize| i32::from(row.get(i).copied().unwrap_or(0));
     let (cb_lo, cb_hi, cr_lo, cr_hi) = (cb.get(ry.lo), cb.get(ry.hi), cr.get(ry.lo), cr.get(ry.hi));
-    if turned {
+    // Chroma blended for every pixel of the row, then the row through the
+    // planar converter's own matrix loop.
+    let (cb_row, cr_row): (Vec<f32>, Vec<f32>) = if turned {
         // The transformed picture's chroma rows run along source columns:
         // its x axis comes from this source row, so the "horizontal"
         // interpolation is between this row's two chroma rows, the same
@@ -1023,21 +1053,20 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
             |lo: &[u16], hi: &[u16]| -> Vec<f32> { (0..lo.len().max(hi.len())).map(|c| PixelRgb::lerp_samples(at(lo, c), at(hi, c), ry.weight)).collect() };
         let (h_cb, h_cr) = (across(cb_lo, cb_hi), across(cr_lo, cr_hi));
         let pick = |h: &[f32], i: usize| h.get(i).copied().unwrap_or(0.0);
-        for ((((o, &s), &lo), &hi), &w) in out.iter_mut().zip(samples).zip(&columns.lo).zip(&columns.hi).zip(&columns.weight) {
-            let cbv = PixelRgb::lerp_rows(pick(&h_cb, lo), pick(&h_cb, hi), w);
-            let crv = PixelRgb::lerp_rows(pick(&h_cr, lo), pick(&h_cr, hi), w);
-            *o = pixel.rgb8(i32::from(s), cbv, crv);
-        }
+        let blend = |h: &[f32]| -> Vec<f32> {
+            columns.lo.iter().zip(&columns.hi).zip(&columns.weight).map(|((&lo, &hi), &w)| PixelRgb::lerp_rows(pick(h, lo), pick(h, hi), w)).collect()
+        };
+        (blend(&h_cb), blend(&h_cr))
     } else {
         // Each chroma row interpolated to this row's width, then blended.
         let along = |row: &[u16]| -> Vec<f32> {
             columns.lo.iter().zip(&columns.hi).zip(&columns.weight).map(|((&lo, &hi), &w)| PixelRgb::lerp_samples(at(row, lo), at(row, hi), w)).collect()
         };
-        let (cb_t, cb_b, cr_t, cr_b) = (along(cb_lo), along(cb_hi), along(cr_lo), along(cr_hi));
-        for (((((o, &s), &ct), &cbm), &rt), &rb) in out.iter_mut().zip(samples).zip(&cb_t).zip(&cb_b).zip(&cr_t).zip(&cr_b) {
-            *o = pixel.rgb8(i32::from(s), PixelRgb::lerp_rows(ct, cbm, ry.weight), PixelRgb::lerp_rows(rt, rb, ry.weight));
-        }
-    }
+        let blend = |top: Vec<f32>, bottom: Vec<f32>| -> Vec<f32> { top.iter().zip(&bottom).map(|(&t, &b)| PixelRgb::lerp_rows(t, b, ry.weight)).collect() };
+        (blend(along(cb_lo), along(cb_hi)), blend(along(cr_lo), along(cr_hi)))
+    };
+    let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
+    pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
     out
 }
 
