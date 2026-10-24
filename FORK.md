@@ -14,6 +14,9 @@ fork has no reason to exist.
 | `decode_rgb8` / `decode_rgb8_with`: RGB bit-identical to `decode` + `to_rgb8` without the planar picture, optionally downscaled (12 MP: 151 → 53 MB full size, 35 MB at 1568 px) | `feat/decode-rgb8-fit` | [#3](https://github.com/Multipad-cyber/heic-decoder-rust/pull/3) |
 | Branch-free CABAC decision and batched bypass bins (−16 to −26 % cycles, bit-identical) | `perf/branch-free-entropy-decoding` | [#4](https://github.com/Multipad-cyber/heic-decoder-rust/pull/4) |
 | Overlay (`iovl`) images, composed in RGB as libheif composes them | `feat/overlay-images` | not yet offered; built on this fork's `main` |
+| Compact sample planes (`u8`/`u16`), pooled tile pictures, SAO by CTB row: memory nearly flat across threads | `perf/compact-planes` | not yet offered; built on this fork's `main` |
+| Inverse transforms as partial butterflies, bounded by the coded coefficients (−2.5 to −17 % cycles) | `perf/butterfly-transforms` | not yet offered; built on this fork's `main` |
+| `decode_rgb8`: tiles decoded ahead on the pool, output rows written in parallel, rows through `Matrix::row` (4 threads ~2× faster) | `perf/tile-pipeline` | not yet offered; built on this fork's `main` |
 
 Each branch is upstream `a1afbf4` plus that change alone, and passes
 `cargo test` and the conformance tests on its own. CI
