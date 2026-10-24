@@ -38,6 +38,19 @@ impl Border {
         usize::try_from(i + base).map_err(|_| HeifError::MalformedHevc("intra border index out of range"))
     }
 
+    /// The samples planar prediction reads: left column top to bottom
+    /// (`-1 ..= -nt`), top row left to right (`1 ..= nt`), and the samples
+    /// at `nt + 1` and `-nt - 1`.
+    fn sides(&self) -> Result<(impl Iterator<Item = &i32>, &[i32], i32, i32)> {
+        let nt = self.nt;
+        let s = self.samples();
+        let c = 2 * nt;
+        let err = || HeifError::MalformedHevc("intra border index out of range");
+        let (top, left) = (s.get(c + 1..c + 1 + nt).ok_or_else(err)?, s.get(c - nt..c).ok_or_else(err)?);
+        let (top_right, bottom_left) = (*s.get(c + 1 + nt).ok_or_else(err)?, *s.get(c - 1 - nt).ok_or_else(err)?);
+        Ok((left.iter().rev(), top, top_right, bottom_left))
+    }
+
     pub fn get(&self, i: isize) -> Result<i32> {
         let idx = self.idx(i)?;
         self.samples().get(idx).copied().ok_or(HeifError::MalformedHevc("intra border index out of range"))
@@ -202,16 +215,19 @@ fn log2(n: usize) -> u32 {
 }
 
 /// Planar prediction (clause 8.4.4.2.4). `dst` is row-major `nt x nt`.
+/// Each row is computed over the top samples in one pass; every term fits
+/// `i32` (at most `2 * nt * 65535 + nt`).
 pub fn predict_planar(dst: &mut [i32], nt: usize, border: &Border) -> Result<()> {
     let log2_nt = log2(nt);
-    for y in 0..nt {
-        for x in 0..nt {
-            let v = (nt - 1 - x) as i64 * border.get(-1 - y as isize)? as i64
-                + (x + 1) as i64 * border.get((1 + nt) as isize)? as i64
-                + (nt - 1 - y) as i64 * border.get((1 + x) as isize)? as i64
-                + (y + 1) as i64 * border.get(-1 - nt as isize)? as i64
-                + nt as i64;
-            *dst.get_mut(x + y * nt).ok_or(HeifError::MalformedHevc("predict_planar: index"))? = (v >> (log2_nt + 1)) as i32;
+    let (left, top, top_right, bottom_left) = border.sides()?;
+    let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_planar: index"))?;
+    let n = nt as i32;
+    for (y, (row, &left)) in dst.chunks_exact_mut(nt).zip(left).enumerate() {
+        let y = y as i32;
+        let fixed = (y + 1) * bottom_left + n;
+        for (x, (d, &top)) in row.iter_mut().zip(top).enumerate() {
+            let x = x as i32;
+            *d = ((n - 1 - x) * left + (x + 1) * top_right + (n - 1 - y) * top + fixed) >> (log2_nt + 1);
         }
     }
     Ok(())
@@ -236,10 +252,9 @@ pub fn predict_dc(dst: &mut [i32], nt: usize, cidx: usize, border: &Border) -> R
         for y in 1..nt {
             *dst.get_mut(y * nt).ok_or(HeifError::MalformedHevc("predict_dc: index"))? = ((border.get(-(y as isize) - 1)? as i64 + 3 * dc_val + 2) >> 2) as i32;
         }
-        for y in 1..nt {
-            for x in 1..nt {
-                *dst.get_mut(x + y * nt).ok_or(HeifError::MalformedHevc("predict_dc: index"))? = dc_val as i32;
-            }
+        let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_dc: index"))?;
+        for row in dst.chunks_exact_mut(nt).skip(1) {
+            row[1..].fill(dc_val as i32);
         }
     } else {
         for v in dst.iter_mut().take(nt * nt) {
@@ -263,21 +278,17 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
     // index arithmetic here is `i64` and only cast to `usize` at the final
     // array access, to avoid mixing integer types across the formulas.
     let off = 2 * nt_i;
-    let put_ref = |reff: &mut [i64], i: i64, v: i64| -> Result<()> {
+    let put_ref = |reff: &mut [i32], i: i64, v: i32| -> Result<()> {
         let idx = usize::try_from(i + off).map_err(|_| HeifError::MalformedHevc("predict_angular: ref index"))?;
         *reff.get_mut(idx).ok_or(HeifError::MalformedHevc("predict_angular: ref index"))? = v;
         Ok(())
     };
-    let get_ref = |reff: &[i64], i: i64| -> Result<i64> {
-        let idx = usize::try_from(i + off).map_err(|_| HeifError::MalformedHevc("predict_angular: ref read"))?;
-        reff.get(idx).copied().ok_or(HeifError::MalformedHevc("predict_angular: ref read"))
-    };
 
     if mode >= 18 {
-        let mut reff_buf = [0i64; MAX_BORDER + 1];
+        let mut reff_buf = [0i32; MAX_BORDER + 1];
         let reff = reff_buf.get_mut(..4 * nt + 2).ok_or(HeifError::MalformedHevc("predict_angular: block larger than 32x32"))?;
         for x in 0..=nt_i {
-            put_ref(reff, x, border.get(x as isize)? as i64)?;
+            put_ref(reff, x, border.get(x as isize)?)?;
         }
         if angle < 0 {
             let inv_angle = *INV_ANGLE.get((mode - 11) as usize).ok_or(HeifError::MalformedHevc("predict_angular: invAngle table"))?;
@@ -285,25 +296,17 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
             if lo < -1 {
                 for x in lo..=-1 {
                     let src = -((x * inv_angle as i64 + 128) >> 8);
-                    put_ref(reff, x, border.get(src as isize)? as i64)?;
+                    put_ref(reff, x, border.get(src as isize)?)?;
                 }
             }
         } else {
             for x in (nt_i + 1)..=(2 * nt_i) {
-                put_ref(reff, x, border.get(x as isize)? as i64)?;
+                put_ref(reff, x, border.get(x as isize)?)?;
             }
         }
-        for y in 0..nt {
-            let i_idx = ((y as i64 + 1) * angle as i64) >> 5;
-            let i_fact = ((y as i64 + 1) * angle as i64) & 31;
-            for x in 0..nt {
-                let v = if i_fact != 0 {
-                    ((32 - i_fact) * get_ref(reff, x as i64 + i_idx + 1)? + i_fact * get_ref(reff, x as i64 + i_idx + 2)? + 16) >> 5
-                } else {
-                    get_ref(reff, x as i64 + i_idx + 1)?
-                };
-                *dst.get_mut(x + y * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))? = v as i32;
-            }
+        let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))?;
+        for (y, row) in dst.chunks_exact_mut(nt).enumerate() {
+            project(row, reff, off, y, angle)?;
         }
         if mode == 26 && cidx == 0 && nt < 32 && !disable_boundary_filter {
             for y in 0..nt {
@@ -312,10 +315,10 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
             }
         }
     } else {
-        let mut reff_buf = [0i64; MAX_BORDER + 1];
+        let mut reff_buf = [0i32; MAX_BORDER + 1];
         let reff = reff_buf.get_mut(..4 * nt + 2).ok_or(HeifError::MalformedHevc("predict_angular: block larger than 32x32"))?;
         for x in 0..=nt_i {
-            put_ref(reff, x, border.get(-x as isize)? as i64)?;
+            put_ref(reff, x, border.get(-x as isize)?)?;
         }
         if angle < 0 {
             let inv_angle = *INV_ANGLE.get((mode - 11) as usize).ok_or(HeifError::MalformedHevc("predict_angular: invAngle table"))?;
@@ -323,24 +326,23 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
             if lo < -1 {
                 for x in lo..=-1 {
                     let src = (x * inv_angle as i64 + 128) >> 8;
-                    put_ref(reff, x, border.get(src as isize)? as i64)?;
+                    put_ref(reff, x, border.get(src as isize)?)?;
                 }
             }
         } else {
             for x in (nt_i + 1)..=(2 * nt_i) {
-                put_ref(reff, x, border.get(-x as isize)? as i64)?;
+                put_ref(reff, x, border.get(-x as isize)?)?;
             }
         }
-        for x in 0..nt {
-            let i_idx = ((x as i64 + 1) * angle as i64) >> 5;
-            let i_fact = ((x as i64 + 1) * angle as i64) & 31;
-            for y in 0..nt {
-                let v = if i_fact != 0 {
-                    ((32 - i_fact) * get_ref(reff, y as i64 + i_idx + 1)? + i_fact * get_ref(reff, y as i64 + i_idx + 2)? + 16) >> 5
-                } else {
-                    get_ref(reff, y as i64 + i_idx + 1)?
-                };
-                *dst.get_mut(x + y * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))? = v as i32;
+        // Columns of the prediction, each a row here, then transposed.
+        let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))?;
+        let mut columns = [0i32; 32 * 32];
+        for (x, column) in columns[..nt * nt].chunks_exact_mut(nt).enumerate() {
+            project(column, reff, off, x, angle)?;
+        }
+        for (y, row) in dst.chunks_exact_mut(nt).enumerate() {
+            for (x, d) in row.iter_mut().enumerate() {
+                *d = columns[x * nt + y];
             }
         }
         if mode == 10 && cidx == 0 && nt < 32 && !disable_boundary_filter {
@@ -349,6 +351,26 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
                 *dst.get_mut(x).ok_or(HeifError::MalformedHevc("predict_angular: boundary filter index"))? = clip(v);
             }
         }
+    }
+    Ok(())
+}
+
+/// One line of angular prediction (clause 8.4.4.2.6): line `k` (a row for
+/// vertical modes, a column for horizontal ones) projected from `reff`,
+/// which is indexed from `-off`. A read outside `reff` is an error.
+fn project(line: &mut [i32], reff: &[i32], off: i64, k: usize, angle: i32) -> Result<()> {
+    let n = line.len();
+    let i_idx = ((k as i64 + 1) * i64::from(angle)) >> 5;
+    let i_fact = (((k as i64 + 1) * i64::from(angle)) & 31) as i32;
+    let err = || HeifError::MalformedHevc("predict_angular: ref read");
+    let start = usize::try_from(i_idx + 1 + off).map_err(|_| err())?;
+    if i_fact != 0 {
+        let r = reff.get(start..start + n + 1).ok_or_else(err)?;
+        for ((d, &a), &b) in line.iter_mut().zip(r).zip(&r[1..]) {
+            *d = ((32 - i_fact) * a + i_fact * b + 16) >> 5;
+        }
+    } else {
+        line.copy_from_slice(reff.get(start..start + n).ok_or_else(err)?);
     }
     Ok(())
 }
