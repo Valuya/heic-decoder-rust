@@ -328,8 +328,90 @@ impl PixelRgb {
     /// A whole row through `Matrix::row` itself, the loop the planar
     /// converter vectorizes; not for monochrome (see [`PixelRgb::rgb8`]).
     pub(crate) fn row8(&self, pixels: &mut [[u8; 3]], luma: &[i32], cb: &[f32], cr: &[f32]) {
-        self.matrix.row::<u8, 3>(pixels, luma, cb, cr);
+        if self.matrix.identity {
+            self.matrix.row::<u8, 3>(pixels, luma, cb, cr);
+            return;
+        }
+        let n = pixels.len().min(luma.len()).min(cb.len()).min(cr.len());
+        let done = SIMD.dispatch(Row8 { m: &self.matrix, pixels: &mut pixels[..n], luma: &luma[..n], cb: &cb[..n], cr: &cr[..n] });
+        self.matrix.row::<u8, 3>(&mut pixels[done..n], &luma[done..n], &cb[done..n], &cr[done..n]);
     }
+}
+
+/// The SIMD level found at start, for [`PixelRgb::row8`].
+static SIMD: std::sync::LazyLock<pulp::Arch> = std::sync::LazyLock::new(pulp::Arch::new);
+
+/// `Matrix::row::<u8, 3>` (not identity) in vector lanes: the same `f32`
+/// expressions in the same order and [`quantize_without_round`]'s rounding,
+/// so the same bytes. Converts whole vectors only and returns how many
+/// pixels it did; the caller does the rest.
+struct Row8<'a> {
+    m: &'a Matrix,
+    pixels: &'a mut [[u8; 3]],
+    luma: &'a [i32],
+    cb: &'a [f32],
+    cr: &'a [f32],
+}
+
+impl pulp::WithSimd for Row8<'_> {
+    type Output = usize;
+
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, simd: S) -> usize {
+        let Row8 { m, pixels, luma, cb, cr } = self;
+        let lanes = S::F32_LANES;
+        if !(2..=16).contains(&lanes) {
+            return 0;
+        }
+        let (y_offset, y_scale, c_offset, c_scale) =
+            (simd.splat_f32s(m.y_offset), simd.splat_f32s(m.y_scale), simd.splat_f32s(m.c_offset), simd.splat_f32s(m.c_scale));
+        let (red_cr, green_cb, green_cr, blue_cb) =
+            (simd.splat_f32s(m.red_cr), simd.splat_f32s(m.green_cb), simd.splat_f32s(m.green_cr), simd.splat_f32s(m.blue_cb));
+        let (mut y_buf, mut channels) = ([0f32; 16], [[0u32; 16]; 3]);
+        let mut done = 0;
+        for (((px, y), cb), cr) in pixels.chunks_exact_mut(lanes).zip(luma.chunks_exact(lanes)).zip(cb.chunks_exact(lanes)).zip(cr.chunks_exact(lanes)) {
+            for (f, &y) in y_buf.iter_mut().zip(y) {
+                *f = y as f32;
+            }
+            let (Some(&yv), Some(&cbv), Some(&crv)) =
+                (S::as_simd_f32s(&y_buf[..lanes]).0.first(), S::as_simd_f32s(cb).0.first(), S::as_simd_f32s(cr).0.first())
+            else {
+                break;
+            };
+            let y = simd.mul_f32s(simd.sub_f32s(yv, y_offset), y_scale);
+            let cb = simd.mul_f32s(simd.sub_f32s(cbv, c_offset), c_scale);
+            let cr = simd.mul_f32s(simd.sub_f32s(crv, c_offset), c_scale);
+            let rgb = [
+                quantize8(simd, simd.add_f32s(y, simd.mul_f32s(red_cr, cr))),
+                quantize8(simd, simd.add_f32s(simd.add_f32s(y, simd.mul_f32s(green_cb, cb)), simd.mul_f32s(green_cr, cr))),
+                quantize8(simd, simd.add_f32s(y, simd.mul_f32s(blue_cb, cb))),
+            ];
+            for (channel, v) in channels.iter_mut().zip(rgb) {
+                if let Some(dst) = S::as_mut_simd_u32s(&mut channel[..lanes]).0.first_mut() {
+                    *dst = v;
+                }
+            }
+            for (k, p) in px.iter_mut().enumerate() {
+                *p = [channels[0][k] as u8, channels[1][k] as u8, channels[2][k] as u8];
+            }
+            done += lanes;
+        }
+        done
+    }
+}
+
+/// [`quantize_without_round`] to 0..=255 in vector lanes. A function, not a
+/// closure: a closure would not get the dispatched target features, and
+/// every intrinsic in it would become a call.
+#[inline(always)]
+fn quantize8<S: pulp::Simd>(simd: S, v: S::f32s) -> S::u32s {
+    const TWO_23: f32 = 8_388_608.0;
+    let (zero, full, two_23, half) = (simd.splat_f32s(0.0), simd.splat_f32s(255.0), simd.splat_f32s(TWO_23), simd.splat_f32s(0.5));
+    let clamped = simd.min_f32s(simd.max_f32s(simd.mul_f32s(v, full), zero), full);
+    let shifted = simd.add_f32s(clamped, two_23);
+    let nearest = simd.sub_u32s(simd.transmute_u32s_f32s(shifted), simd.splat_u32s(TWO_23.to_bits()));
+    let tie = simd.equal_f32s(simd.sub_f32s(clamped, simd.sub_f32s(shifted, two_23)), half);
+    simd.add_u32s(nearest, simd.select_u32s(tie, simd.splat_u32s(1), simd.splat_u32s(0)))
 }
 
 /// An alpha sample as [`DecodedImage::to_rgba8`] scales it to 0..=255.
