@@ -540,7 +540,25 @@ impl Sink {
             Sink::Full { width, data } => {
                 let row = *width * 3;
                 let touched = scatter.rows_touched(first, converted.len(), data.len() / row.max(1));
+                // Turned, a batch whose rows land on one run of transformed
+                // columns: each transformed row gathers one source column.
+                let run = Scatter::span(&scatter.row_t[first..first + converted.len()]).filter(|&(start, _, len, _)| start == 0 && len == converted.len());
                 data[touched.start * row..touched.end * row].par_chunks_mut(row).zip(touched).for_each(|(out, ty)| {
+                    if let (true, None, Some((_, t0, len, reversed))) = (scatter.turned, alpha, run) {
+                        let Some(x) = scatter.source_of_row[ty] else { return };
+                        let Some(dst) = out.as_chunks_mut::<3>().0.get_mut(t0..t0 + len) else { return };
+                        let gather = |(d, src): (&mut [u8; 3], &Vec<[u8; 3]>)| {
+                            if let Some(s) = src.get(x) {
+                                *d = *s;
+                            }
+                        };
+                        if reversed {
+                            dst.iter_mut().rev().zip(converted).for_each(gather);
+                        } else {
+                            dst.iter_mut().zip(converted).for_each(gather);
+                        }
+                        return;
+                    }
                     // An unturned row whose columns land on one run: a copy.
                     if let (false, None, Some((x0, t0, len, reversed))) = (scatter.turned, alpha, scatter.span) {
                         let Some(src) = scatter.source_of_row[ty].and_then(|y| y.checked_sub(first)).and_then(|i| converted.get(i)) else { return };
