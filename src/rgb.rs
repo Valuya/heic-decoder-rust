@@ -19,7 +19,8 @@
 //! odd-sized tiles, an alpha plane to composite, an overlay — go through
 //! [`crate::decode`] instead, under the same limits.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::mpsc;
 
 use rayon::prelude::*;
 
@@ -412,6 +413,81 @@ enum Sink {
     Bins(Bins),
 }
 
+/// Where converted source pixels land in the transformed picture, for
+/// writing a batch of rows in parallel: each output row (or row of bins)
+/// is owned by one task, and gathers its pixels from one source row, or
+/// one source column when the picture is turned.
+struct Scatter {
+    turned: bool,
+    /// Transformed coordinate of each source row and source column.
+    row_t: Vec<Option<usize>>,
+    col_t: Vec<Option<usize>>,
+    /// For each transformed row: the source row (unturned) or source
+    /// column (turned) it comes from.
+    source_of_row: Vec<Option<usize>>,
+}
+
+impl Scatter {
+    fn new(rows: &SourceAxis, columns: &SourceAxis, transformed_height: usize) -> Self {
+        let turned = columns.axis == 1;
+        let row_t: Vec<Option<usize>> = rows.entries.iter().map(|e| e.map(|e| e.t)).collect();
+        let col_t: Vec<Option<usize>> = columns.entries.iter().map(|e| e.map(|e| e.t)).collect();
+        let mut source_of_row = vec![None; transformed_height];
+        for (s, t) in (if turned { &col_t } else { &row_t }).iter().enumerate() {
+            if let Some(t) = t {
+                source_of_row[*t] = Some(s);
+            }
+        }
+        Scatter { turned, row_t, col_t, source_of_row }
+    }
+
+    /// The transformed rows a batch of source rows writes to: all of them
+    /// when turned (each holds a source column), else the batch's own.
+    fn rows_touched(&self, first: usize, count: usize, height: usize) -> std::ops::Range<usize> {
+        if self.turned {
+            return 0..height;
+        }
+        let ts = self.row_t[first..first + count].iter().flatten();
+        match (ts.clone().min(), ts.max()) {
+            (Some(&lo), Some(&hi)) => lo..hi + 1,
+            _ => 0..0,
+        }
+    }
+
+    /// The pixels of transformed row `ty` that the batch of source rows
+    /// `first..first + converted.len()` holds, as `(tx, rgb)`.
+    fn row_pixels<'a>(&'a self, ty: usize, first: usize, converted: &'a [Vec<[u8; 3]>]) -> impl Iterator<Item = (usize, [u8; 3])> + 'a {
+        let source = self.source_of_row[ty];
+        let unturned = (!self.turned)
+            .then(|| source.and_then(|y| y.checked_sub(first)).and_then(|i| converted.get(i)))
+            .flatten()
+            .into_iter()
+            .flat_map(move |row| self.col_t.iter().zip(row).filter_map(|(t, rgb)| Some(((*t)?, *rgb))));
+        let turned = self
+            .turned
+            .then_some(source)
+            .flatten()
+            .into_iter()
+            .flat_map(move |x| converted.iter().enumerate().filter_map(move |(i, row)| Some((self.row_t[first + i]?, *row.get(x)?))));
+        unturned.chain(turned)
+    }
+}
+
+/// An alpha plane to composite over a background, at transformed size.
+struct AlphaOver {
+    samples: Vec<i32>,
+    width: usize,
+    max: u32,
+    background: [u8; 3],
+}
+
+impl AlphaOver {
+    #[inline(always)]
+    fn apply(&self, tx: usize, ty: usize, rgb: [u8; 3]) -> [u8; 3] {
+        over(rgb, alpha8(self.samples[ty * self.width + tx] as u32, self.max), self.background)
+    }
+}
+
 impl Sink {
     fn full(width: usize, height: usize) -> Result<Self> {
         let len = width.checked_mul(height).and_then(|p| p.checked_mul(3)).ok_or(HeifError::LimitExceeded("RGB: output size"))?;
@@ -436,32 +512,67 @@ impl Sink {
         }
     }
 
-    /// One source row's pixels, in source order. Into bins, neighbouring
-    /// pixels that land in the same bin are summed first and added once.
-    fn put_row(&mut self, pixels: impl Iterator<Item = (usize, usize, [u8; 3])>) {
+    /// A batch of converted source rows, written in parallel over output
+    /// rows (or rows of bins), each owned by one task.
+    fn put_batch(&mut self, scatter: &Scatter, first: usize, converted: &[Vec<[u8; 3]>], alpha: Option<&AlphaOver>) {
+        let pixel = |tx: usize, ty: usize, rgb: [u8; 3]| match alpha {
+            Some(a) => a.apply(tx, ty, rgb),
+            None => rgb,
+        };
         match self {
             Sink::Full { width, data } => {
-                for (x, y, rgb) in pixels {
-                    let i = (y * *width + x) * 3;
-                    data[i..i + 3].copy_from_slice(&rgb);
-                }
+                let row = *width * 3;
+                let touched = scatter.rows_touched(first, converted.len(), data.len() / row.max(1));
+                data[touched.start * row..touched.end * row].par_chunks_mut(row).zip(touched).for_each(|(out, ty)| {
+                    for (tx, rgb) in scatter.row_pixels(ty, first, converted) {
+                        out[tx * 3..tx * 3 + 3].copy_from_slice(&pixel(tx, ty, rgb));
+                    }
+                });
             }
             Sink::Bins(bins) => {
-                let mut run: Option<(usize, [u32; 3])> = None;
-                for (x, y, rgb) in pixels {
-                    let bin = bins.maps[0].parts[x] + bins.maps[1].parts[y];
-                    match &mut run {
-                        Some((b, sum)) if *b == bin => sum.iter_mut().zip(rgb).for_each(|(s, c)| *s += u32::from(c)),
-                        _ => {
-                            if let Some((b, sum)) = run {
-                                bins.add_sum(b, sum);
+                let [x_map, y_map] = &bins.maps;
+                let stride = bins.out.0 * 3;
+                // Transformed rows of each row of bins: consecutive, in order.
+                let mut starts = Vec::with_capacity(y_map.counts.len() + 1);
+                let mut t = 0;
+                for &n in &y_map.counts {
+                    starts.push(t);
+                    t += n as usize;
+                }
+                starts.push(t);
+                let fill = |br: usize, add: &mut dyn FnMut(usize, [u32; 3])| {
+                    for ty in starts[br]..starts[br + 1] {
+                        let mut run: Option<(usize, [u32; 3])> = None;
+                        for (tx, rgb) in scatter.row_pixels(ty, first, converted) {
+                            let rgb = pixel(tx, ty, rgb);
+                            let bin = x_map.parts[tx];
+                            match &mut run {
+                                Some((b, sum)) if *b == bin => sum.iter_mut().zip(rgb).for_each(|(s, c)| *s += u32::from(c)),
+                                _ => {
+                                    if let Some((b, sum)) = run {
+                                        add(b, sum);
+                                    }
+                                    run = Some((bin, rgb.map(u32::from)));
+                                }
                             }
-                            run = Some((bin, rgb.map(u32::from)));
+                        }
+                        if let Some((b, sum)) = run {
+                            add(b, sum);
                         }
                     }
-                }
-                if let Some((b, sum)) = run {
-                    bins.add_sum(b, sum);
+                };
+                // Rows of bins the batch reaches.
+                let touched = scatter.rows_touched(first, converted.len(), t);
+                let bin_row = |ty: usize| y_map.parts[ty] / bins.out.0.max(1);
+                let rows = if touched.is_empty() { 0..0 } else { bin_row(touched.start)..bin_row(touched.end - 1) + 1 };
+                match &mut bins.sums {
+                    Sums::Narrow(sums) => sums[rows.start * stride..rows.end * stride].par_chunks_mut(stride).zip(rows).for_each(|(row, br)| {
+                        // A run is part of one bin, so it fits whatever the bin fits.
+                        fill(br, &mut |b, sum| row[b * 3..b * 3 + 3].iter_mut().zip(sum).for_each(|(s, c)| *s += c as u16));
+                    }),
+                    Sums::Wide(sums) => sums[rows.start * stride..rows.end * stride].par_chunks_mut(stride).zip(rows).for_each(|(row, br)| {
+                        fill(br, &mut |b, sum| row[b * 3..b * 3 + 3].iter_mut().zip(sum).for_each(|(s, c)| *s += c));
+                    }),
                 }
             }
         }
@@ -536,17 +647,6 @@ impl Bins {
         match &mut self.sums {
             Sums::Narrow(s) => s[i..i + 3].iter_mut().zip(rgb).for_each(|(s, c)| *s += u16::from(c)),
             Sums::Wide(s) => s[i..i + 3].iter_mut().zip(rgb).for_each(|(s, c)| *s += u32::from(c)),
-        }
-    }
-
-    /// Adds a run's summed channels to output pixel `bin`.
-    #[inline(always)]
-    fn add_sum(&mut self, bin: usize, sum: [u32; 3]) {
-        let i = bin * 3;
-        match &mut self.sums {
-            // A run is part of one bin, so it fits whatever the bin fits.
-            Sums::Narrow(s) => s[i..i + 3].iter_mut().zip(sum).for_each(|(s, c)| *s += c as u16),
-            Sums::Wide(s) => s[i..i + 3].iter_mut().zip(sum).for_each(|(s, c)| *s += c),
         }
     }
 
@@ -699,11 +799,115 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
         None if parsed.images.len() == 1 => (1, 1),
         None => return Ok(None),
     };
+    let images = &parsed.images;
     // Each thread decodes its tiles into the pictures of the tiles placed
     // before them.
     let pool = PicturePool::default();
+    // Called from inside rayon's pool, blocking on a channel could starve
+    // a one-thread pool; with one thread, a decoder thread beside the
+    // caller only adds switching. Decode a few tiles at a time there.
+    if rayon::current_thread_index().is_some() || rayon::current_num_threads() == 1 || images.len() == 1 {
+        let threads = rayon::current_num_threads();
+        return convert(parsed, options, columns, rows, &pool, &mut Chunked { images, pool: &pool, threads, pending: BTreeMap::new() });
+    }
+    rayon::in_place_scope(|scope| {
+        let (sender, receiver) = mpsc::channel();
+        let window = TILES_AHEAD_PER_THREAD * rayon::current_num_threads();
+        let mut feed = Ahead { scope, images, pool: &pool, window, sender, receiver, spawned: 0, pending: BTreeMap::new() };
+        feed.spawn_until(window);
+        convert(parsed, options, columns, rows, &pool, &mut feed)
+    })
+}
+
+/// Tiles decoded ahead of the one being placed, per thread: enough that
+/// no thread waits at a row boundary, few enough that what is held stays
+/// a couple of tiles per thread.
+const TILES_AHEAD_PER_THREAD: usize = 2;
+
+/// Where [`convert`] gets its decoded tiles, in raster order.
+trait Tiles {
+    fn tile(&mut self, index: usize) -> Result<Tile>;
+}
+
+/// Tiles decoded on rayon's pool, a window of them beyond the one being
+/// placed, while the calling thread places and converts rows: the threads
+/// never wait for a row to finish, and conversion overlaps decoding.
+struct Ahead<'s, 'p> {
+    scope: &'s rayon::Scope<'p>,
+    images: &'p [ResolvedImage],
+    pool: &'p PicturePool,
+    window: usize,
+    sender: mpsc::Sender<(usize, Result<Tile>)>,
+    receiver: mpsc::Receiver<(usize, Result<Tile>)>,
+    spawned: usize,
+    /// Tiles that arrived before their turn.
+    pending: BTreeMap<usize, Result<Tile>>,
+}
+
+impl<'p> Ahead<'_, 'p> {
+    /// Starts decoding every tile below index `end`.
+    fn spawn_until(&mut self, end: usize) {
+        let end = end.min(self.images.len());
+        while self.spawned < end {
+            let (index, image, pool, sender) = (self.spawned, &self.images[self.spawned], self.pool, self.sender.clone());
+            self.scope.spawn(move |_| {
+                // The receiver is gone only if the caller already failed.
+                let _ = sender.send((index, decode_tile(image, pool)));
+            });
+            self.spawned += 1;
+        }
+    }
+}
+
+impl Tiles for Ahead<'_, '_> {
+    fn tile(&mut self, index: usize) -> Result<Tile> {
+        self.spawn_until(index + 1 + self.window);
+        loop {
+            if let Some(tile) = self.pending.remove(&index) {
+                return tile;
+            }
+            let (arrived, tile) = self.receiver.recv().map_err(|_| HeifError::MalformedHevc("RGB: tile decoder stopped"))?;
+            self.pending.insert(arrived, tile);
+        }
+    }
+}
+
+/// Tiles decoded a few at a time (one per thread) by the caller: with one
+/// thread, or when the caller is itself on rayon's pool.
+struct Chunked<'p> {
+    images: &'p [ResolvedImage],
+    pool: &'p PicturePool,
+    threads: usize,
+    pending: BTreeMap<usize, Tile>,
+}
+
+impl Tiles for Chunked<'_> {
+    fn tile(&mut self, index: usize) -> Result<Tile> {
+        if let Some(tile) = self.pending.remove(&index) {
+            return Ok(tile);
+        }
+        let end = (index + self.threads.max(1)).min(self.images.len());
+        let pool = self.pool;
+        let decoded: Vec<Tile> = self.images[index..end].par_iter().map(|image| decode_tile(image, pool)).collect::<Result<_>>()?;
+        let mut decoded = decoded.into_iter();
+        let first = decoded.next().ok_or(HeifError::MalformedBox("grid has no tiles"))?;
+        self.pending.extend((index + 1..end).zip(decoded));
+        Ok(first)
+    }
+}
+
+/// [`stream`]'s conversion, fed tiles in raster order by `tiles`; their
+/// pictures go back to `pool` once placed.
+fn convert(
+    parsed: &isobmff::ParsedHeif,
+    options: &DecodeRgbOptions,
+    columns: usize,
+    rows: usize,
+    pool: &PicturePool,
+    tiles: &mut dyn Tiles,
+) -> Result<Option<RgbImage<u8>>> {
     // The first tile tells the layout; it is placed like the others.
-    let first = decode_tile(&parsed.images[0], &pool)?;
+    let first = tiles.tile(0)?;
     let shape = first.shape;
     let (width, height) = match parsed.grid {
         Some(grid) => (grid.output_width as usize, grid.output_height as usize),
@@ -753,12 +957,13 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
                 return Err(HeifError::Unsupported("alpha: display dimensions do not match colour image"));
             }
             let max = (1u32 << plane.bit_depth_luma) - 1;
-            Some((plane.y, plane.width, max, background))
+            Some(AlphaOver { samples: plane.y, width: plane.width, max, background })
         }
         _ => None,
     };
 
     let full = (g.luma.width, g.luma.height);
+    let scatter = Scatter::new(&rows_axis, &columns_axis, full.1);
     let out = fit_within(full, options.max_edge);
     let mut sink = if out == full {
         Sink::full(full.0, full.1)?
@@ -768,34 +973,24 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
 
     let (mut luma, mut cb, mut cr) = (Rows::new(), Rows::new(), Rows::new());
     let mut first = Some(first);
-    let threads = rayon::current_num_threads().max(1);
     let mut next_y = 0;
     for band_index in 0..rows {
-        // Decode the row of tiles a few at a time (one per thread), each
-        // placed in the band as soon as it is decoded.
+        // Each tile is placed in the band as soon as it is its turn.
         let mut band = layout.band(band_index);
-        let tiles = &parsed.images[band_index * columns..][..columns];
-        let mut column = 0;
-        if let Some(tile) = first.take() {
-            layout.place(&mut band, 0, &tile);
-            pool.give(tile.pic);
-            column = 1;
-        }
-        while column < columns {
-            let end = (column + threads).min(columns);
-            let decoded: Vec<Tile> = tiles[column..end].par_iter().map(|image| decode_tile(image, &pool)).collect::<Result<_>>()?;
-            for (offset, tile) in decoded.into_iter().enumerate() {
-                let s = tile.shape;
-                if (s.format, s.bit_depth_luma, s.bit_depth_chroma) != (shape.format, shape.bit_depth_luma, shape.bit_depth_chroma) {
-                    return Err(HeifError::Unsupported("decode: grid tiles with inconsistent bit depth/chroma format are not supported"));
-                }
-                if (s.width, s.height) != (shape.width, shape.height) {
-                    return Ok(None);
-                }
-                layout.place(&mut band, column + offset, &tile);
-                pool.give(tile.pic);
+        for column in 0..columns {
+            let tile = match first.take() {
+                Some(tile) => tile,
+                None => tiles.tile(band_index * columns + column)?,
+            };
+            let s = tile.shape;
+            if (s.format, s.bit_depth_luma, s.bit_depth_chroma) != (shape.format, shape.bit_depth_luma, shape.bit_depth_chroma) {
+                return Err(HeifError::Unsupported("decode: grid tiles with inconsistent bit depth/chroma format are not supported"));
             }
-            column = end;
+            if (s.width, s.height) != (shape.width, shape.height) {
+                return Ok(None);
+            }
+            layout.place(&mut band, column, &tile);
+            pool.give(tile.pic);
         }
         luma.rows.extend(band.luma);
         cb.rows.extend(band.cb);
@@ -811,19 +1006,7 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
             let batch_end = (batch + ROWS_PER_BATCH).min(ready);
             let converted: Vec<Vec<[u8; 3]>> =
                 (batch..batch_end).into_par_iter().map(|y| convert_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, turned, &pixel)).collect();
-            for (y, row) in (batch..batch_end).zip(converted) {
-                let Some(ry) = rows_axis.entries[y] else { continue };
-                let pixels = columns_axis.entries.iter().zip(row).filter_map(|(cx, rgb)| {
-                    let cx = (*cx)?;
-                    let (tx, ty) = if turned { (ry.t, cx.t) } else { (cx.t, ry.t) };
-                    let rgb = match &alpha {
-                        Some((samples, alpha_width, max, background)) => over(rgb, alpha8(samples[ty * alpha_width + tx] as u32, *max), *background),
-                        None => rgb,
-                    };
-                    Some((tx, ty, rgb))
-                });
-                sink.put_row(pixels);
-            }
+            sink.put_batch(&scatter, batch, &converted, alpha.as_ref());
         }
         next_y = ready;
         luma.drop_below(next_y);
