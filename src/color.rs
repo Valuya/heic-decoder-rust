@@ -324,6 +324,12 @@ impl PixelRgb {
     pub(crate) fn monochrome(&self) -> bool {
         self.monochrome
     }
+
+    /// A whole row through `Matrix::row` itself, the loop the planar
+    /// converter vectorizes; not for monochrome (see [`PixelRgb::rgb8`]).
+    pub(crate) fn row8(&self, pixels: &mut [[u8; 3]], luma: &[i32], cb: &[f32], cr: &[f32]) {
+        self.matrix.row::<u8, 3>(pixels, luma, cb, cr);
+    }
 }
 
 /// An alpha sample as [`DecodedImage::to_rgba8`] scales it to 0..=255.
