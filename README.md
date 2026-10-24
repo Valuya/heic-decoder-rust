@@ -86,7 +86,7 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 
 - `max_edge`: scale the longest edge down to at most this size, by averaging the full-size pixels that fall in each output pixel. Only the output is held.
 - `alpha`: `AlphaMode::Ignore` (the default, as `to_rgb8` does; the alpha image is then not decoded at all) or `AlphaMode::Over([r, g, b])`, which composites over a background using alpha as `to_rgba8` scales it.
-- `rgb`: the same `RgbOptions` as `to_rgb8_with_options`.
+- `rgb`: the same `RgbOptions` as `to_rgb8_with_options`. With `upsampling: ChromaUpsampling::Nearest`, each pixel takes the chroma sample of its cell instead of interpolating between neighbours, as libheif's default conversion and the Java decoder do. It is lower quality at colour edges, and faster: no chroma sample is interpolated then (nor for 4:4:4 pictures), so rows skip that arithmetic altogether. Use it to compare speed with those decoders on equal work.
 - `max_picture_pixels`, `max_total_pixels`: limits on every coded picture, at its uncropped SPS size, and on a grid's canvas and the sum of its tiles. They are checked before anything is allocated, because a failed allocation aborts the process.
 - `reuse_chroma_rows` (default `true`): interpolate each chroma row once for all the output rows that read it, instead of once per output row. The pixels are the same either way. It applies to pictures that are not turned by a 90° rotation, and makes decoding them about 9% faster on one core (6 sample photos, user-space cycles); turned pictures take the per-row path regardless. Turn it off to compare, or to rule it out.
 

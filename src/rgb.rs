@@ -999,6 +999,9 @@ fn convert(
     let rows_axis = source_axis(height, true, &g, &tables);
     let turned = columns_axis.axis == 1;
     let column_arrays = Columns::new(&columns_axis);
+    // Nearest-neighbour chroma (or 4:4:4) gives every interpolation a
+    // weight of 0, and `lo * (1 - 0) + hi * 0` is exactly `lo`.
+    let flat = column_arrays.weight.iter().chain(rows_axis.entries.iter().flatten().map(|e| &e.weight)).all(|&w| w == 0.0);
 
     // Chroma rows each source row reads, and the lowest any later row reads.
     let needs: Vec<Option<(usize, usize)>> =
@@ -1062,7 +1065,10 @@ fn convert(
         }
         for batch in (next_y..ready).step_by(ROWS_PER_BATCH) {
             let batch_end = (batch + ROWS_PER_BATCH).min(ready);
-            let converted: Vec<Vec<[u8; 3]>> = if turned || !options.reuse_chroma_rows {
+            let converted: Vec<Vec<[u8; 3]>> = if flat {
+                // No interpolation anywhere: each pixel's chroma is one sample.
+                (batch..batch_end).into_par_iter().map(|y| flat_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, &pixel)).collect()
+            } else if turned || !options.reuse_chroma_rows {
                 // A turned picture's rows share no interpolated chroma.
                 (batch..batch_end).into_par_iter().map(|y| convert_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, turned, &pixel)).collect()
             } else {
@@ -1206,6 +1212,28 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
         let blend = |top: Vec<f32>, bottom: Vec<f32>| -> Vec<f32> { top.iter().zip(&bottom).map(|(&t, &b)| PixelRgb::lerp_rows(t, b, ry.weight)).collect() };
         (blend(along(cb_lo), along(cb_hi)), blend(along(cr_lo), along(cr_hi)))
     };
+    let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
+    pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
+    out
+}
+
+/// A source row when no chroma sample is interpolated (every weight 0):
+/// the arithmetic of `convert_row` with each interpolation reduced to the
+/// sample it keeps, exactly, as `x * 1.0 + y * 0.0 == x` for the
+/// non-negative integers samples are. Upright or turned, that sample is
+/// chroma row `ry.lo` at column `columns.lo[x]`.
+fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) -> Vec<[u8; 3]> {
+    let samples = luma.get(y);
+    let Some(ry) = rows.entries[y] else { return Vec::new() };
+    let mut out = vec![[0u8; 3]; samples.len()];
+    if pixel.monochrome() {
+        for (o, &s) in out.iter_mut().zip(samples) {
+            *o = pixel.rgb8(i32::from(s), 0.0, 0.0);
+        }
+        return out;
+    }
+    let pick = |row: &[u16]| -> Vec<f32> { columns.lo.iter().map(|&lo| at(row, lo) as f32).collect() };
+    let (cb_row, cr_row) = (pick(cb.get(ry.lo)), pick(cr.get(ry.lo)));
     let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
     pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
     out
