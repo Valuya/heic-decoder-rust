@@ -23,12 +23,13 @@ use std::collections::VecDeque;
 
 use rayon::prelude::*;
 
-use crate::color::{Axis, ChromaSampling, PixelRgb, RgbImage, RgbOptions, alpha8, axis};
+use crate::color::{Axis, ChromaSampling, ColorInfo, PixelRgb, RgbImage, RgbOptions, alpha8, axis};
 use crate::error::{HeifError, Result};
+use crate::hevc::ctu::Picture;
 use crate::hevc::nal::NAL_SPS;
 use crate::hevc::params::parse_sps;
 use crate::isobmff::{self, ResolvedImage, Transform};
-use crate::{DecodedImage, MAX_IMAGE_PIXELS, chroma_subsampling, crop_axis, decode_one_image, find_and_parse, image_from_picture};
+use crate::{ImageWindow, MAX_IMAGE_PIXELS, PicturePool, chroma_subsampling, conformance_window, crop_axis, decode_into, find_and_parse};
 
 /// What to do with an alpha plane.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -581,16 +582,16 @@ struct TileShape {
     bit_depth_chroma: u32,
 }
 
-impl TileShape {
-    fn of(tile: &DecodedImage) -> Self {
-        TileShape {
-            width: tile.width,
-            height: tile.height,
-            format: tile.chroma_format_idc,
-            bit_depth_luma: tile.bit_depth_luma,
-            bit_depth_chroma: tile.bit_depth_chroma,
-        }
-    }
+/// A decoded tile: its picture as decoded, and where in it the image
+/// `decode` would crop it to lies.
+struct Tile {
+    pic: Picture,
+    shape: TileShape,
+    /// Luma origin of the SPS conformance window.
+    left: usize,
+    top: usize,
+    sampling: ChromaSampling,
+    color_info: Option<ColorInfo>,
 }
 
 /// One row of tiles laid out as source rows, as `blit_tiles` places them on
@@ -620,21 +621,22 @@ impl Layout {
         Band { luma: vec![vec![0; self.width]; rows], cb: vec![vec![0; self.cb_width]; c_rows], cr: vec![vec![0; self.cb_width]; c_rows] }
     }
 
-    /// Copies the tile in column `column` into `band`.
-    fn place(&self, band: &mut Band, column: usize, tile: &DecodedImage) {
+    /// Copies the tile in column `column` into `band`, straight from the
+    /// decoded picture's planes.
+    fn place(&self, band: &mut Band, column: usize, tile: &Tile) {
         let x0 = column * self.tile.width;
         let w = self.tile.width.min(self.width.saturating_sub(x0));
         if w == 0 {
             return;
         }
-        let narrow = |dst: &mut [u16], src: &[i32]| dst.iter_mut().zip(src).for_each(|(d, &s)| *d = s as u16);
         for (r, row) in band.luma.iter_mut().enumerate() {
-            narrow(&mut row[x0..x0 + w], &tile.y[r * tile.width..][..w]);
+            tile.pic.y.copy_row(tile.left, tile.top + r, &mut row[x0..x0 + w]);
         }
         let (cx, cw) = (x0 / self.sub_w, w.div_ceil(self.sub_w));
+        let (left, top) = (tile.left / self.sub_w, tile.top / self.sub_h);
         for (r, (row_cb, row_cr)) in band.cb.iter_mut().zip(band.cr.iter_mut()).enumerate() {
-            narrow(&mut row_cb[cx..cx + cw], &tile.cb[r * tile.cb_width..][..cw]);
-            narrow(&mut row_cr[cx..cx + cw], &tile.cr[r * tile.cb_width..][..cw]);
+            tile.pic.cb.copy_row(left, top + r, &mut row_cb[cx..cx + cw]);
+            tile.pic.cr.copy_row(left, top + r, &mut row_cr[cx..cx + cw]);
         }
     }
 }
@@ -663,8 +665,22 @@ impl Rows {
     }
 }
 
-fn decode_tile(image: &ResolvedImage) -> Result<DecodedImage> {
-    decode_one_image(image).and_then(|(sps, pic)| image_from_picture(&sps, pic))
+/// Decodes a tile into a picture from `pool`, and resolves the crop `decode`
+/// would make (failing as it would).
+fn decode_tile(image: &ResolvedImage, pool: &PicturePool) -> Result<Tile> {
+    let (sps, pic) = decode_into(image, None, pool.take())?;
+    let format = sps.chroma_format_idc;
+    let mut sampling = ChromaSampling::coded(format, sps.chroma_location);
+    let window = conformance_window(&sps)?;
+    let ImageWindow { left, top, width, height } =
+        window.unwrap_or(ImageWindow { left: 0, top: 0, width: sps.pic_width_in_luma_samples as usize, height: sps.pic_height_in_luma_samples as usize });
+    if window.is_some() {
+        let (sub_w, sub_h) = chroma_subsampling(format);
+        sampling.origin_x -= (left % sub_w) as f32;
+        sampling.origin_y -= (top % sub_h) as f32;
+    }
+    let shape = TileShape { width, height, format, bit_depth_luma: sps.bit_depth_luma, bit_depth_chroma: sps.bit_depth_chroma };
+    Ok(Tile { pic, shape, left, top, sampling, color_info: sps.color_info })
 }
 
 /// Rows converted per parallel batch.
@@ -683,12 +699,15 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
         None if parsed.images.len() == 1 => (1, 1),
         None => return Ok(None),
     };
+    // Each thread decodes its tiles into the pictures of the tiles placed
+    // before them.
+    let pool = PicturePool::default();
     // The first tile tells the layout; it is placed like the others.
-    let first = decode_tile(&parsed.images[0])?;
-    let shape = TileShape::of(&first);
+    let first = decode_tile(&parsed.images[0], &pool)?;
+    let shape = first.shape;
     let (width, height) = match parsed.grid {
         Some(grid) => (grid.output_width as usize, grid.output_height as usize),
-        None => (first.width, first.height),
+        None => (shape.width, shape.height),
     };
     let (sub_w, sub_h) = chroma_subsampling(shape.format);
     // Tiles on chroma boundaries stack into whole chroma rows, as the grid
@@ -697,7 +716,7 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
         return Ok(None);
     }
     let (cb_width, cb_height) = if shape.format == 0 { (0, 0) } else { (width.div_ceil(sub_w), height.div_ceil(sub_h)) };
-    let g = geometry(width, height, cb_width, cb_height, shape.format, first.chroma_sampling, &parsed.transforms)?;
+    let g = geometry(width, height, cb_width, cb_height, shape.format, first.sampling, &parsed.transforms)?;
     if !converter_accepts(&g, shape.format) {
         return Ok(None);
     }
@@ -759,20 +778,22 @@ fn stream(parsed: &isobmff::ParsedHeif, options: &DecodeRgbOptions) -> Result<Op
         let mut column = 0;
         if let Some(tile) = first.take() {
             layout.place(&mut band, 0, &tile);
+            pool.give(tile.pic);
             column = 1;
         }
         while column < columns {
             let end = (column + threads).min(columns);
-            let decoded: Vec<DecodedImage> = tiles[column..end].par_iter().map(decode_tile).collect::<Result<_>>()?;
-            for (offset, tile) in decoded.iter().enumerate() {
-                let s = TileShape::of(tile);
+            let decoded: Vec<Tile> = tiles[column..end].par_iter().map(|image| decode_tile(image, &pool)).collect::<Result<_>>()?;
+            for (offset, tile) in decoded.into_iter().enumerate() {
+                let s = tile.shape;
                 if (s.format, s.bit_depth_luma, s.bit_depth_chroma) != (shape.format, shape.bit_depth_luma, shape.bit_depth_chroma) {
                     return Err(HeifError::Unsupported("decode: grid tiles with inconsistent bit depth/chroma format are not supported"));
                 }
                 if (s.width, s.height) != (shape.width, shape.height) {
                     return Ok(None);
                 }
-                layout.place(&mut band, column + offset, tile);
+                layout.place(&mut band, column + offset, &tile);
+                pool.give(tile.pic);
             }
             column = end;
         }

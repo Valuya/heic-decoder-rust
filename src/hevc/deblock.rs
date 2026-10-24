@@ -12,7 +12,7 @@
 //! `imazen/heic`'s deblocking module rather than typed from memory, the
 //! same way this crate's other spec-mandated constant tables are.
 
-use super::ctu::{Picture, Plane};
+use super::ctu::{Picture, Plane, Sample, Samples};
 use super::params::Sps;
 use super::transform::chroma_qp_mapping;
 use crate::error::{HeifError, Result};
@@ -95,22 +95,31 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
     let (x, y) = (x as usize, y as usize);
     // Sample `j` (p3..p0, q0..q3) of line `k`.
     let index = |k: usize, j: usize| if vertical { (y + k) * w + x - 4 + j } else { (y + j - 4) * w + x + k };
-    let samples = pic.y.samples_mut();
+    match pic.y.samples_mut() {
+        Samples::Narrow(samples) => filter_luma_lines(samples, index, beta, tc, max_val, protect_p, protect_q),
+        Samples::Wide(samples) => filter_luma_lines(samples, index, beta, tc, max_val, protect_p, protect_q),
+    }
+    Ok(())
+}
+
+/// Reads a segment's four lines (`index(k, j)` is sample `j` of line `k`),
+/// filters them and writes back the sides that are not protected.
+#[allow(clippy::too_many_arguments)]
+fn filter_luma_lines<T: Sample>(samples: &mut [T], index: impl Fn(usize, usize) -> usize, beta: i32, tc: i32, max_val: i32, protect_p: bool, protect_q: bool) {
     let mut lines = [[0i32; 8]; 4];
     for (k, line) in lines.iter_mut().enumerate() {
         for (j, v) in line.iter_mut().enumerate() {
-            *v = samples[index(k, j)];
+            *v = samples[index(k, j)].into();
         }
     }
-    let Some(decision) = luma_decision(&lines[0], &lines[3], beta, tc) else { return Ok(()) };
+    let Some(decision) = luma_decision(&lines[0], &lines[3], beta, tc) else { return };
     for (k, line) in lines.iter_mut().enumerate() {
         filter_luma_line(line, &decision, max_val);
         let sides = [(!protect_p, 0..4), (!protect_q, 4..8)];
         for j in sides.into_iter().filter(|(write, _)| *write).flat_map(|(_, js)| js) {
-            samples[index(k, j)] = line[j];
+            samples[index(k, j)] = T::narrow(line[j]);
         }
     }
-    Ok(())
 }
 
 /// One line of samples across a luma edge: `p3 p2 p1 p0 q0 q1 q2 q3`.
@@ -213,14 +222,21 @@ fn filter_chroma_pixels(plane: &mut Plane, cx: i64, cy: i64, vertical: bool, tc:
     }
     // Samples p1 p0 q0 q1 across the edge.
     let (center, step) = (cy as usize * plane.width + cx as usize, if vertical { 1 } else { plane.width });
-    let samples = plane.samples_mut();
-    let [p1, p0, q0, q1] = [center - 2 * step, center - step, center, center + step].map(|i| samples[i]);
+    match plane.samples_mut() {
+        Samples::Narrow(samples) => filter_chroma_pair(samples, center, step, tc, max_val, protect_p, protect_q),
+        Samples::Wide(samples) => filter_chroma_pair(samples, center, step, tc, max_val, protect_p, protect_q),
+    }
+}
+
+/// The pair's filter on samples `p1 p0 q0 q1` at `center - 2 * step ..= center + step`.
+fn filter_chroma_pair<T: Sample>(samples: &mut [T], center: usize, step: usize, tc: i32, max_val: i32, protect_p: bool, protect_q: bool) {
+    let [p1, p0, q0, q1] = [center - 2 * step, center - step, center, center + step].map(|i| -> i32 { samples[i].into() });
     let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
     if !protect_p {
-        samples[center - step] = (p0 + delta).clamp(0, max_val);
+        samples[center - step] = T::narrow((p0 + delta).clamp(0, max_val));
     }
     if !protect_q {
-        samples[center] = (q0 - delta).clamp(0, max_val);
+        samples[center] = T::narrow((q0 - delta).clamp(0, max_val));
     }
 }
 
