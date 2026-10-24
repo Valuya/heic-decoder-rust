@@ -14,6 +14,7 @@
 use super::cabac::Engine;
 use super::contexts::Contexts;
 use super::scan::{Pos, intra_scan_idx, scan_order};
+use super::transform::CoeffBox;
 use crate::error::{HeifError, Result};
 
 /// `ctxIdxMap[16]` (clause 9.3.4.2.5), used only for 4x4 ( `log2TrafoSize
@@ -172,6 +173,10 @@ fn push_sig(buf: &mut [usize; 17], n_sig: &mut usize, pos: usize) -> Result<()> 
     Ok(())
 }
 
+/// Decodes one transform block's coefficient levels into `coeffs`
+/// (row-major, zeros where none is coded) and returns a box they lie in,
+/// so dequantization and the inverse transform can skip the rest: the
+/// coded 4x4 subblocks' box, or the DC alone when it is the only level.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_residual(
     engine: &mut Engine,
@@ -182,7 +187,7 @@ pub fn decode_residual(
     is_luma_or_444: bool,
     sign_data_hiding_enabled: bool,
     coeffs: &mut [i32],
-) -> Result<bool> {
+) -> Result<CoeffBox> {
     let nt = 1usize << log2_trafo_size;
     let coeffs = coeffs.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("residual: coefficient buffer too small"))?;
     coeffs.fill(0);
@@ -197,6 +202,8 @@ pub fn decode_residual(
     if scan_idx == 2 {
         std::mem::swap(&mut last_x, &mut last_y);
     }
+    // The rightmost column and lowest row that can hold a coefficient.
+    let (mut max_x, mut max_y) = (0u32, 0u32);
     // The last significant coefficient is the DC: no other one is coded.
     let dc_only = last_x == 0 && last_y == 0;
 
@@ -293,6 +300,10 @@ pub fn decode_residual(
         if sig_positions.is_empty() {
             continue;
         }
+        // The box of the coefficients, to whole subblocks: tracking single
+        // coefficients in the level loop below costs more than it saves.
+        max_x = max_x.max((s.x << 2) + 3);
+        max_y = max_y.max((s.y << 2) + 3);
 
         // `sig_positions` is currently in descending scan-position order
         // (as found above); the spec processes greater1/greater2/signs
@@ -388,7 +399,7 @@ pub fn decode_residual(
         }
     }
 
-    Ok(dc_only)
+    Ok(if dc_only { CoeffBox { width: 1, height: 1 } } else { CoeffBox { width: max_x as usize + 1, height: max_y as usize + 1 } })
 }
 
 #[cfg(test)]

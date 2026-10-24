@@ -1217,7 +1217,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 };
                 let intra_pred_mode = if self.current_intra { mode as u32 } else { 0 };
                 let coeffs = block(&mut scratch.coeffs, nt)?;
-                let dc_only = decode_residual(
+                let bounds = decode_residual(
                     self.engine,
                     &mut self.ctxs,
                     log2_size,
@@ -1249,7 +1249,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                     let dequantized = block(&mut scratch.dequantized, nt)?;
                     let scale = Dequant::new(qp, bit_depth, log2_size)?;
                     let use_dst = self.current_intra && cidx == 0 && nt == 4;
-                    if dc_only && !transform_skip && !use_dst {
+                    if bounds.dc_only() && !transform_skip && !use_dst {
                         // Flat areas code most blocks as one DC level.
                         let weight = match self.scaling_list {
                             Some(weights) => *weights.table(log2_size, cidx)?.first().ok_or(HeifError::MalformedHevc("scaling list: empty table"))?,

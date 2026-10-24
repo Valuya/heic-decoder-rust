@@ -170,6 +170,26 @@ fn clip_coeff(v: i32) -> i32 {
     v.clamp(-32768, 32767)
 }
 
+/// Where a transform block's nonzero coefficients can be: every
+/// coefficient at column `x >= width` or row `y >= height` is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoeffBox {
+    pub width: usize,
+    pub height: usize,
+}
+
+impl CoeffBox {
+    /// The whole `nt x nt` block.
+    pub fn full(nt: usize) -> Self {
+        CoeffBox { width: nt, height: nt }
+    }
+
+    /// Only the DC coefficient can be nonzero.
+    pub fn dc_only(self) -> bool {
+        self.width <= 1 && self.height <= 1
+    }
+}
+
 /// Inverse transform for an `nT x nT` block of dequantized coefficients
 /// (row-major, `coeffs[y*nT+x]`), producing the spatial residual
 /// (row-major `i32`). `use_dst` selects the 4x4 DST-VII (luma intra 4x4
