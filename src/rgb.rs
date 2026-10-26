@@ -1101,12 +1101,21 @@ struct Columns {
     lo: Vec<usize>,
     hi: Vec<usize>,
     weight: Vec<f32>,
+    /// `Some((lo[0], phase))` when column `x` reads chroma `lo[0] + (x + phase) / 2`
+    /// (4:2:0, nearest), `phase` 0 or 1.
+    halves: Option<(usize, usize)>,
 }
 
 impl Columns {
     fn new(axis: &SourceAxis) -> Self {
         let get = |f: fn(&Entry) -> usize| axis.entries.iter().map(|e| e.as_ref().map_or(0, f)).collect();
-        Columns { lo: get(|e| e.lo), hi: get(|e| e.hi), weight: axis.entries.iter().map(|e| e.map_or(0.0, |e| e.weight)).collect() }
+        let lo: Vec<usize> = get(|e| e.lo);
+        let halves = lo.first().copied().filter(|_| axis.entries.iter().all(Option::is_some)).and_then(|lo0| {
+            // the last columns may be clamped to the last chroma sample
+            let last = lo.iter().copied().max().unwrap_or(0);
+            (0..2).find(|&phase| lo.iter().enumerate().all(|(x, &l)| l == (lo0 + (x + phase) / 2).min(last))).map(|phase| (lo0, phase))
+        });
+        Columns { lo, hi: get(|e| e.hi), weight: axis.entries.iter().map(|e| e.map_or(0.0, |e| e.weight)).collect(), halves }
     }
 }
 
@@ -1231,6 +1240,31 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
             *o = pixel.rgb8(i32::from(s), 0.0, 0.0);
         }
         return out;
+    }
+    if let Some((lo0, phase)) = columns.halves
+        && std::env::var("HEIC_NO_FUSED").as_deref() != Ok("1")
+    {
+        let (cb_row, cr_row) = (cb.get(ry.lo), cr.get(ry.lo));
+        let chroma = |x: usize| {
+            let c = columns.lo.get(x).copied().unwrap_or(0);
+            (at(cb_row, c) as f32, at(cr_row, c) as f32)
+        };
+        let mut fused = Vec::with_capacity(samples.len());
+        // With phase 1, pixel 0 has its chroma sample alone; pairs start at pixel 1.
+        let head = phase.min(samples.len());
+        for (x, &s) in samples.iter().enumerate().take(head) {
+            let (c_b, c_r) = chroma(x);
+            fused.push(pixel.rgb8(i32::from(s), c_b, c_r));
+        }
+        let c0 = lo0 + phase;
+        let last = columns.lo.iter().copied().max().unwrap_or(0);
+        let (cb_k, cr_k) = (cb_row.get(c0..=last).unwrap_or(&[]), cr_row.get(c0..=last).unwrap_or(&[]));
+        let done = head + pixel.row8_420_nearest(&mut fused, &samples[head..], cb_k, cr_k);
+        for (x, &s) in samples.iter().enumerate().skip(done) {
+            let (c_b, c_r) = chroma(x);
+            fused.push(pixel.rgb8(i32::from(s), c_b, c_r));
+        }
+        return fused;
     }
     let pick = |row: &[u16]| -> Vec<f32> { columns.lo.iter().map(|&lo| at(row, lo) as f32).collect() };
     let (cb_row, cr_row) = (pick(cb.get(ry.lo)), pick(cr.get(ry.lo)));
