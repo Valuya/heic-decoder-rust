@@ -15,5 +15,7 @@ pub mod scaling;
 pub mod scan;
 pub mod slice;
 pub mod transform;
+#[cfg(target_arch = "x86_64")]
+mod transform_avx2;
 
 pub mod inter;
