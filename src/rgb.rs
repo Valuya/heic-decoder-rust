@@ -766,10 +766,24 @@ struct Layout {
 }
 
 impl Layout {
-    fn band(&self, index: usize) -> Band {
+    /// Band `index`'s rows, reusing `spare` rows where there are (every
+    /// sample of a band row is placed from a tile, so reused rows need no clearing).
+    fn band(&self, index: usize, spare: [&mut Vec<Vec<u16>>; 3]) -> Band {
         let rows = self.tile.height.min(self.height.saturating_sub(index * self.tile.height));
         let c_rows = if self.tile.format == 0 { 0 } else { rows.div_ceil(self.sub_h) };
-        Band { luma: vec![vec![0; self.width]; rows], cb: vec![vec![0; self.cb_width]; c_rows], cr: vec![vec![0; self.cb_width]; c_rows] }
+        let [sl, sb, sr] = spare;
+        let take = |spare: &mut Vec<Vec<u16>>, n: usize, width: usize| -> Vec<Vec<u16>> {
+            (0..n)
+                .map(|_| match spare.pop() {
+                    Some(mut r) => {
+                        r.resize(width, 0);
+                        r
+                    }
+                    None => vec![0; width],
+                })
+                .collect()
+        };
+        Band { luma: take(sl, rows, self.width), cb: take(sb, c_rows, self.cb_width), cr: take(sr, c_rows, self.cb_width) }
     }
 
     /// Copies the tile in column `column` into `band`, straight from the
@@ -796,11 +810,13 @@ impl Layout {
 struct Rows {
     first: usize,
     rows: VecDeque<Vec<u16>>,
+    /// Rows dropped below the converted ones, reused for the next bands.
+    spare: Vec<Vec<u16>>,
 }
 
 impl Rows {
     fn new() -> Self {
-        Rows { first: 0, rows: VecDeque::new() }
+        Rows { first: 0, rows: VecDeque::new(), spare: Vec::new() }
     }
     fn end(&self) -> usize {
         self.first + self.rows.len()
@@ -810,7 +826,9 @@ impl Rows {
     }
     fn drop_below(&mut self, row: usize) {
         while self.first < row && !self.rows.is_empty() {
-            self.rows.pop_front();
+            if let Some(r) = self.rows.pop_front() {
+                self.spare.push(r);
+            }
             self.first += 1;
         }
     }
@@ -1037,7 +1055,7 @@ fn convert(
     let mut next_y = 0;
     for band_index in 0..rows {
         // Each tile is placed in the band as soon as it is its turn.
-        let mut band = layout.band(band_index);
+        let mut band = layout.band(band_index, [&mut luma.spare, &mut cb.spare, &mut cr.spare]);
         for column in 0..columns {
             let tile = match first.take() {
                 Some(tile) => tile,
