@@ -391,6 +391,43 @@ impl pulp::NullaryFnOnce for Row420Avx2<'_> {
         let (cbs, _) = cb.as_chunks::<8>();
         let (crs, _) = cr.as_chunks::<8>();
         let mut done = 0;
+        if *FAST_RGB {
+            // Opt-in, libheif's precision: 8-bit fixed-point coefficients,
+            // out = clip((ky * (Y - yo) + k * (C - co) + 128) >> 8). For full-range
+            // video ky is 256 and this is libheif's Y + ((k * C' + 128) >> 8).
+            let avx2 = simd.avx2;
+            let f = |v: f32| (v * 255.0 * 256.0).round() as i32;
+            let ky = avx._mm256_set1_epi32(f(m.y_scale));
+            let (kr, kgb, kgr, kb) = (
+                avx._mm256_set1_epi32(f(m.red_cr * m.c_scale)),
+                avx._mm256_set1_epi32(f(m.green_cb * m.c_scale)),
+                avx._mm256_set1_epi32(f(m.green_cr * m.c_scale)),
+                avx._mm256_set1_epi32(f(m.blue_cb * m.c_scale)),
+            );
+            let (yo, co) = (avx._mm256_set1_epi32(m.y_offset.round() as i32), avx._mm256_set1_epi32(m.c_offset.round() as i32));
+            let (rnd, low16) = (avx._mm256_set1_epi32(128), avx._mm256_set1_epi32(0xFFFF));
+            for ((y, cb), cr) in ys.iter().zip(cbs).zip(crs) {
+                let yv: core::arch::x86_64::__m256i = cast(*y);
+                let ye = avx2._mm256_mullo_epi32(avx2._mm256_sub_epi32(avx2._mm256_and_si256(yv, low16), yo), ky);
+                let yo_ = avx2._mm256_mullo_epi32(avx2._mm256_sub_epi32(avx2._mm256_srli_epi32::<16>(yv), yo), ky);
+                let cbi = avx2._mm256_sub_epi32(avx2._mm256_cvtepu16_epi32(cast(*cb)), co);
+                let cri = avx2._mm256_sub_epi32(avx2._mm256_cvtepu16_epi32(cast(*cr)), co);
+                let tr = avx2._mm256_add_epi32(avx2._mm256_mullo_epi32(kr, cri), rnd);
+                let tg = avx2._mm256_add_epi32(avx2._mm256_add_epi32(avx2._mm256_mullo_epi32(kgb, cbi), avx2._mm256_mullo_epi32(kgr, cri)), rnd);
+                let tb = avx2._mm256_add_epi32(avx2._mm256_mullo_epi32(kb, cbi), rnd);
+                let r = to_bytes_even_odd(simd, avx2._mm256_srai_epi32::<8>(avx2._mm256_add_epi32(ye, tr)), avx2._mm256_srai_epi32::<8>(avx2._mm256_add_epi32(yo_, tr)));
+                let g = to_bytes_even_odd(simd, avx2._mm256_srai_epi32::<8>(avx2._mm256_add_epi32(ye, tg)), avx2._mm256_srai_epi32::<8>(avx2._mm256_add_epi32(yo_, tg)));
+                let b = to_bytes_even_odd(simd, avx2._mm256_srai_epi32::<8>(avx2._mm256_add_epi32(ye, tb)), avx2._mm256_srai_epi32::<8>(avx2._mm256_add_epi32(yo_, tb)));
+                let block = cast::<[__m128i; 3], [[u8; 3]; 16]>([
+                    interleave(simd, r, g, b, &masks, 0),
+                    interleave(simd, r, g, b, &masks, 1),
+                    interleave(simd, r, g, b, &masks, 2),
+                ]);
+                out.extend_from_slice(&block);
+                done += 16;
+            }
+            return done;
+        }
         if *EVEN_ODD {
             // Even and odd pixels apart: each pair shares its chroma sample, so the
             // chroma terms are computed once, on eight lanes. Same f32 operations,
@@ -1207,3 +1244,8 @@ mod tests {
         assert!(image(-1).to_rgb8_with_options(&nearest).is_err());
     }
 }
+
+/// PoC switch: `HEIC_FAST_RGB=1` converts nearest 4:2:0 rows with libheif's
+/// 8-bit fixed-point precision (not bit-identical to the exact f32 formula).
+#[cfg(target_arch = "x86_64")]
+static FAST_RGB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_FAST_RGB").as_deref() == Ok("1"));
