@@ -339,11 +339,11 @@ pub(crate) struct SaoRows {
 /// `Picture::flags` bits, one byte per 4x4 min-PU.
 const SKIP: u8 = 1;
 const RESIDUAL: u8 = 1 << 1;
-const BYPASS: u8 = 1 << 2;
-const CU_EDGE_LEFT: u8 = 1 << 3;
-const CU_EDGE_TOP: u8 = 1 << 4;
-const TU_EDGE_LEFT: u8 = 1 << 5;
-const TU_EDGE_TOP: u8 = 1 << 6;
+pub(crate) const BYPASS: u8 = 1 << 2;
+pub(crate) const CU_EDGE_LEFT: u8 = 1 << 3;
+pub(crate) const CU_EDGE_TOP: u8 = 1 << 4;
+pub(crate) const TU_EDGE_LEFT: u8 = 1 << 5;
+pub(crate) const TU_EDGE_TOP: u8 = 1 << 6;
 
 fn min_pu_index(min_pu_width: usize, min_pu_height: usize, x: i64, y: i64) -> Option<usize> {
     if x < 0 || y < 0 || (x as usize) >= min_pu_width * 4 || (y as usize) >= min_pu_height * 4 {
@@ -521,6 +521,16 @@ impl Picture {
             }
         }
     }
+    /// For deblocking an intra picture's luma: the luma plane, and beside it
+    /// (borrowed apart) the per-min-PU flags and `QpY`, the min-PU row width
+    /// and the slice's first row. `None` once any PU is inter-coded.
+    pub(crate) fn luma_deblock_parts(&mut self) -> Option<(&mut Plane, &[u8], &[i8], usize, usize)> {
+        if !self.motions.is_empty() {
+            return None;
+        }
+        Some((&mut self.y, &self.flags, &self.qp_y, self.min_pu_width, self.slice_start_y))
+    }
+
     pub(crate) fn has_bypass(&self) -> bool {
         self.flags.iter().any(|&f| f & BYPASS != 0)
     }
