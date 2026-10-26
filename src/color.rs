@@ -422,6 +422,58 @@ fn doubled(simd: pulp::x86::V3, c: core::arch::x86_64::__m128i) -> (core::arch::
     (avx._mm256_cvtepi32_ps(lo), avx._mm256_cvtepi32_ps(hi))
 }
 
+/// The co-sited bilinear blend of chroma `h` (from its first column) to
+/// `width` pixels, 16 at a time with AVX2, as `PixelRgb::lerp_rows` computes
+/// it: pixel `2j` is `h[j] * 1 + h[j + 1] * 0`, pixel `2j + 1` is
+/// `h[j] * 0.5 + h[j + 1] * 0.5`. Appends only blocks whose samples are all
+/// inside `h` (none without AVX2); the caller does the rest.
+pub(crate) fn blend_halves(out: &mut Vec<f32>, h: &[f32], width: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if *AVX2 {
+        if let Some(simd) = pulp::x86::V3::try_new() {
+            simd.vectorize(BlendHalves { simd, out, h, width });
+        }
+    }
+    let _ = (out, h, width);
+}
+
+#[cfg(target_arch = "x86_64")]
+struct BlendHalves<'a> {
+    simd: pulp::x86::V3,
+    out: &'a mut Vec<f32>,
+    h: &'a [f32],
+    width: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for BlendHalves<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn call(self) {
+        use core::arch::x86_64::__m256;
+        use pulp::bytemuck::cast;
+        let BlendHalves { simd, out, h, width } = self;
+        let avx = simd.avx;
+        let (one, zero, half) = (avx._mm256_set1_ps(1.0), avx._mm256_set1_ps(0.0), avx._mm256_set1_ps(0.5));
+        let mut j = 0;
+        // block j..j+8 reads h[j..j+9] and writes pixels 2j..2j+16
+        while 2 * j + 16 <= width && j + 9 <= h.len() {
+            let a: [f32; 8] = h[j..j + 8].try_into().unwrap_or([0.0; 8]);
+            let b: [f32; 8] = h[j + 1..j + 9].try_into().unwrap_or([0.0; 8]);
+            let (a, b): (__m256, __m256) = (cast(a), cast(b));
+            let even = avx._mm256_add_ps(avx._mm256_mul_ps(a, one), avx._mm256_mul_ps(b, zero));
+            let odd = avx._mm256_add_ps(avx._mm256_mul_ps(a, half), avx._mm256_mul_ps(b, half));
+            let (lo, hi) = (avx._mm256_unpacklo_ps(even, odd), avx._mm256_unpackhi_ps(even, odd));
+            let first: [f32; 8] = cast(avx._mm256_permute2f128_ps::<0x20>(lo, hi));
+            let second: [f32; 8] = cast(avx._mm256_permute2f128_ps::<0x31>(lo, hi));
+            out.extend_from_slice(&first);
+            out.extend_from_slice(&second);
+            j += 8;
+        }
+    }
+}
+
 /// Whether the AVX2 row kernel runs; `HEIC_NO_SIMD=1` turns it off (for A/B runs).
 #[cfg(target_arch = "x86_64")]
 static AVX2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_SIMD").as_deref() != Ok("1"));
