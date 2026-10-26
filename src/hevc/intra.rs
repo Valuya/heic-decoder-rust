@@ -381,13 +381,13 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
         }
         // Columns of the prediction, each a row here, then transposed.
         let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))?;
-        let mut columns = [0i32; 32 * 32];
-        for (x, column) in columns[..nt * nt].chunks_exact_mut(nt).enumerate() {
+        // One column at a time into a line, written straight down `dst`'s column.
+        let mut line = [0i32; 32];
+        for x in 0..nt {
+            let column = &mut line[..nt];
             project(column, reff, off, x, angle)?;
-        }
-        for (y, row) in dst.chunks_exact_mut(nt).enumerate() {
-            for (x, d) in row.iter_mut().enumerate() {
-                *d = columns[x * nt + y];
+            for (d, &v) in dst[x..].iter_mut().step_by(nt).zip(column.iter()) {
+                *d = v;
             }
         }
         if mode == 10 && cidx == 0 && nt < 32 && !disable_boundary_filter {
