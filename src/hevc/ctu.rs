@@ -145,6 +145,66 @@ impl Plane {
         if self.is_decoded(idx) { self.samples.get(idx) } else { None }
     }
 
+    /// Intra border samples straight from the plane, in [`Border`]'s order
+    /// (left column bottom to top, corner, top row left to right), with
+    /// `avail` set where a sample is: in the picture, at or below `start_y`
+    /// and decoded. Blocks are 4-aligned, so availability is checked once per
+    /// 4 samples. `false` (nothing written) for a block that is not.
+    pub(crate) fn border_into(&self, x0: usize, y0: usize, nt: usize, start_y: usize, data: &mut [i32], avail: &mut [bool]) -> bool {
+        if nt < 4 || x0 % 4 != 0 || y0 % 4 != 0 || self.width % 4 != 0 || self.height % 4 != 0 || data.len() < 4 * nt + 1 || avail.len() < 4 * nt + 1 {
+            return false;
+        }
+        match &self.samples {
+            Samples::Narrow(s) => self.border_groups(s, x0, y0, nt, start_y, data, avail),
+            Samples::Wide(s) => self.border_groups(s, x0, y0, nt, start_y, data, avail),
+        }
+        true
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn border_groups<T: Sample>(&self, s: &[T], x0: usize, y0: usize, nt: usize, start_y: usize, data: &mut [i32], avail: &mut [bool]) {
+        let w = self.width;
+        let available = |x: usize, y: usize| y >= start_y && x < w && y < self.height && self.is_decoded(y * w + x);
+        let n2 = 2 * nt;
+        if x0 > 0 {
+            let x = x0 - 1;
+            // left column, group g: rows y0 + 2nt - 1 - 4g down to y0 + 2nt - 4 - 4g
+            for g in 0..n2 / 4 {
+                let y_low = y0 + n2 - 4 - 4 * g;
+                if available(x, y_low) {
+                    for j in 0..4 {
+                        let k = 4 * g + j;
+                        if let Some(&v) = s.get((y0 + n2 - 1 - k) * w + x) {
+                            data[k] = v.into();
+                            avail[k] = true;
+                        }
+                    }
+                }
+            }
+            if y0 > 0 && available(x, y0 - 1) {
+                if let Some(&v) = s.get((y0 - 1) * w + x) {
+                    data[n2] = v.into();
+                    avail[n2] = true;
+                }
+            }
+        }
+        if y0 > 0 {
+            let row = (y0 - 1) * w;
+            for g in 0..n2 / 4 {
+                let x = x0 + 4 * g;
+                if available(x, y0 - 1) {
+                    if let Some(src) = s.get(row + x..row + x + 4) {
+                        for (j, &v) in src.iter().enumerate() {
+                            data[n2 + 1 + 4 * g + j] = v.into();
+                            avail[n2 + 1 + 4 * g + j] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Post-reconstruction passes (deblocking, SAO) only ever run after
     /// every sample in the picture has already been written once by the
     /// CTU decode driver, so the `decoded` gate `get`/`set` enforce
@@ -663,6 +723,7 @@ struct Decoder<'e, 'b, 'c> {
 /// Working buffers for one transform block, sized for the largest (32x32)
 /// and reused for every block instead of allocating per block.
 struct BlockScratch {
+    border: Border,
     pred: [i32; 32 * 32],
     coeffs: [i32; 32 * 32],
     dequantized: [i32; 32 * 32],
@@ -676,7 +737,7 @@ fn block(buf: &mut [i32], nt: usize) -> Result<&mut [i32]> {
 
 impl BlockScratch {
     fn new() -> Box<Self> {
-        Box::new(BlockScratch { pred: [0; 32 * 32], coeffs: [0; 32 * 32], dequantized: [0; 32 * 32], residual: [0; 32 * 32] })
+        Box::new(BlockScratch { border: Border::empty(), pred: [0; 32 * 32], coeffs: [0; 32 * 32], dequantized: [0; 32 * 32], residual: [0; 32 * 32] })
     }
 }
 
@@ -1397,14 +1458,24 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
             let timer = timing::start(Stage::Intra);
             if self.current_intra {
                 let start_y = pic.slice_start_y / if cidx == 0 { 1 } else { self.sps.sub_height_c() as usize };
-                let mut border = Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) })?;
+                let border = &mut scratch.border;
+                if *OLD_BORDER {
+                    *border = Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) })?;
+                } else {
+                    border.fill(
+                        nt,
+                        bit_depth,
+                        |data, avail| plane.border_into(x0, y0, nt, start_y, data, avail),
+                        || Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) }),
+                    )?;
+                }
                 if is_luma_or_444 {
                     border.filter(nt, cidx, mode, bit_depth, self.sps.strong_intra_smoothing_enabled)?;
                 }
                 match mode {
-                    0 => predict_planar(pred, nt, &border)?,
-                    1 => predict_dc(pred, nt, cidx, &border)?,
-                    _ => predict_angular(pred, nt, cidx, mode, bit_depth, false, &border)?,
+                    0 => predict_planar(pred, nt, border)?,
+                    1 => predict_dc(pred, nt, cidx, border)?,
+                    _ => predict_angular(pred, nt, cidx, mode, bit_depth, false, border)?,
                 }
             } else {
                 for y in 0..nt {
@@ -1795,3 +1866,6 @@ mod tests {
         assert_eq!(rem_mode_from_candidates(0, cand), 2);
     }
 }
+
+/// `HEIC_OLD_BORDER=1`: build intra borders sample by sample (for A/B runs).
+static OLD_BORDER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_OLD_BORDER").as_deref() == Ok("1"));

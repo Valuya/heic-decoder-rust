@@ -133,6 +133,51 @@ impl Border {
         Ok(Border { data: data_buf, nt })
     }
 
+    /// An all-zero border, to be filled by [`Border::fill`].
+    pub fn empty() -> Self {
+        Border { data: [0; MAX_BORDER], nt: 0 }
+    }
+
+    /// [`Border::build`] in place: `fetch_groups(data, avail)` writes the
+    /// available samples and marks them; this substitutes the rest. `false`
+    /// from it means it could not, and `fallback` builds the border instead.
+    pub fn fill(
+        &mut self, nt: usize, bit_depth: u32, fetch_groups: impl FnOnce(&mut [i32], &mut [bool]) -> bool,
+        fallback: impl FnOnce() -> Result<Border>,
+    ) -> Result<()> {
+        let len = 4 * nt + 1;
+        if len > MAX_BORDER {
+            return Err(HeifError::MalformedHevc("intra border: block larger than 32x32"));
+        }
+        let mut avail_buf = [false; MAX_BORDER];
+        self.nt = nt;
+        let (data, avail) = (&mut self.data[..len], &mut avail_buf[..len]);
+        if !fetch_groups(data, avail) {
+            *self = fallback()?;
+            return Ok(());
+        }
+        match avail.iter().position(|&a| a) {
+            None => data.fill(1i32 << (bit_depth - 1)),
+            Some(first) => {
+                // Unavailable samples come in runs: each takes the sample before it
+                // (the first available one before any).
+                let mut last = data[first];
+                let mut k = 0;
+                while k < len {
+                    if avail[k] {
+                        last = data[k];
+                        k += 1;
+                    } else {
+                        let end = avail[k..].iter().position(|&a| a).map_or(len, |p| k + p);
+                        data[k..end].fill(last);
+                        k = end;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reference sample filtering (clause 8.4.4.2.3): the 1:2:1 smoothing
     /// filter, or the strong-intra-smoothing bilinear filter for a flat
     /// 32-wide luma block. No-op unless the mode/size combination calls
