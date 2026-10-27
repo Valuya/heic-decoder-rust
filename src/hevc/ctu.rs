@@ -362,6 +362,8 @@ fn min_pu_index(min_pu_width: usize, min_pu_height: usize, x: i64, y: i64) -> Op
 
 /// [`Picture::luma_deblock_parts`]: the luma plane, flags, `QpY`, min-PU row width, slice's first row.
 pub(crate) type LumaDeblockParts<'a> = (&'a mut Plane, &'a [u8], &'a [i8], usize, usize);
+/// [`Picture::chroma_deblock_parts`]: both chroma planes, then as [`LumaDeblockParts`].
+pub(crate) type ChromaDeblockParts<'a> = (&'a mut Plane, &'a mut Plane, &'a [u8], &'a [i8], usize, usize);
 
 /// Which min-PUs are coded with transquant bypass, read while a plane is
 /// borrowed mutably.
@@ -540,6 +542,16 @@ impl Picture {
             return None;
         }
         Some((&mut self.y, &self.flags, &self.qp_y, self.min_pu_width, self.slice_start_y))
+    }
+
+    /// For deblocking an intra picture's chroma: both chroma planes, and beside
+    /// them the per-min-PU flags and `QpY`, the min-PU row width and the
+    /// slice's first row. `None` once any PU is inter-coded.
+    pub(crate) fn chroma_deblock_parts(&mut self) -> Option<ChromaDeblockParts<'_>> {
+        if !self.motions.is_empty() {
+            return None;
+        }
+        Some((&mut self.cb, &mut self.cr, &self.flags, &self.qp_y, self.min_pu_width, self.slice_start_y))
     }
 
     pub(crate) fn has_bypass(&self) -> bool {
