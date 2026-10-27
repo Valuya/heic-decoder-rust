@@ -343,6 +343,85 @@ impl PixelRgb {
     }
 }
 
+impl PixelRgb {
+    /// A 4:2:0 row with nearest chroma straight from the samples: pixel `x`
+    /// takes chroma sample `x / 2`. Appends whole blocks of 16 pixels to
+    /// `out` with the AVX2 kernel and returns how many it did (0 without AVX2,
+    /// for identity or monochrome); the caller converts the rest.
+    pub(crate) fn row8_420_nearest(&self, out: &mut Vec<[u8; 3]>, luma: &[u16], cb: &[u16], cr: &[u16]) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if !self.matrix.identity && !self.monochrome && *AVX2 {
+            if let Some(simd) = pulp::x86::V3::try_new() {
+                return simd.vectorize(Row420Avx2 { simd, m: &self.matrix, out, luma, cb, cr });
+            }
+        }
+        let _ = (out, luma, cb, cr);
+        0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Row420Avx2<'a> {
+    simd: pulp::x86::V3,
+    m: &'a Matrix,
+    out: &'a mut Vec<[u8; 3]>,
+    luma: &'a [u16],
+    cb: &'a [u16],
+    cr: &'a [u16],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for Row420Avx2<'_> {
+    type Output = usize;
+
+    #[inline(always)]
+    fn call(self) -> usize {
+        use core::arch::x86_64::__m128i;
+        use pulp::bytemuck::cast;
+        let Row420Avx2 { simd, m, out, luma, cb, cr } = self;
+        let avx = simd.avx;
+        let k = Consts {
+            y_offset: avx._mm256_set1_ps(m.y_offset), y_scale: avx._mm256_set1_ps(m.y_scale),
+            c_offset: avx._mm256_set1_ps(m.c_offset), c_scale: avx._mm256_set1_ps(m.c_scale),
+            red_cr: avx._mm256_set1_ps(m.red_cr), green_cb: avx._mm256_set1_ps(m.green_cb),
+            green_cr: avx._mm256_set1_ps(m.green_cr), blue_cb: avx._mm256_set1_ps(m.blue_cb),
+        };
+        let masks: [__m128i; 9] = cast(INTERLEAVE);
+        let (ys, _) = luma.as_chunks::<16>();
+        let (cbs, _) = cb.as_chunks::<8>();
+        let (crs, _) = cr.as_chunks::<8>();
+        let mut done = 0;
+        for ((y, cb), cr) in ys.iter().zip(cbs).zip(crs) {
+            let [y0, y1]: [[u16; 8]; 2] = cast(*y);
+            let (y0, y1) = (simd.avx2._mm256_cvtepu16_epi32(cast(y0)), simd.avx2._mm256_cvtepu16_epi32(cast(y1)));
+            let (cb0, cb1) = doubled(simd, cast(*cb));
+            let (cr0, cr1) = doubled(simd, cast(*cr));
+            let lo = rgb_lanes(simd, &k, y0, cb0, cr0);
+            let hi = rgb_lanes(simd, &k, y1, cb1, cr1);
+            let (r, g, b) = (to_bytes(simd, lo[0], hi[0]), to_bytes(simd, lo[1], hi[1]), to_bytes(simd, lo[2], hi[2]));
+            let block = cast::<[__m128i; 3], [[u8; 3]; 16]>([
+                interleave(simd, r, g, b, &masks, 0),
+                interleave(simd, r, g, b, &masks, 1),
+                interleave(simd, r, g, b, &masks, 2),
+            ]);
+            out.extend_from_slice(&block);
+            done += 16;
+        }
+        done
+    }
+}
+
+/// Eight chroma samples, each repeated for two pixels, as two vectors of
+/// eight `f32` lanes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn doubled(simd: pulp::x86::V3, c: core::arch::x86_64::__m128i) -> (core::arch::x86_64::__m256, core::arch::x86_64::__m256) {
+    let (sse2, avx, avx2) = (simd.sse2, simd.avx, simd.avx2);
+    let lo = avx2._mm256_cvtepu16_epi32(sse2._mm_unpacklo_epi16(c, c));
+    let hi = avx2._mm256_cvtepu16_epi32(sse2._mm_unpackhi_epi16(c, c));
+    (avx._mm256_cvtepi32_ps(lo), avx._mm256_cvtepi32_ps(hi))
+}
+
 /// Whether the AVX2 row kernel runs; `HEIC_NO_SIMD=1` turns it off (for A/B runs).
 #[cfg(target_arch = "x86_64")]
 static AVX2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_SIMD").as_deref() != Ok("1"));
