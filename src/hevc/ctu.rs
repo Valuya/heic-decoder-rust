@@ -308,6 +308,25 @@ impl Plane {
 
     /// Copies `dst.len()` samples of the flat raster from `(x, y)` on, as
     /// `u16`. Nothing is copied past the end of the plane.
+    /// [`Plane::copy_row`] for an 8-bit plane; a deeper one keeps its low byte
+    /// (never asked: the converter holds deeper planes in `u16`).
+    pub(crate) fn copy_row_narrow(&self, x: usize, y: usize, dst: &mut [u8]) {
+        let start = y * self.width + x;
+        let range = start..start + dst.len();
+        match &self.samples {
+            Samples::Narrow(samples) => {
+                if let Some(src) = samples.get(range) {
+                    dst.copy_from_slice(src);
+                }
+            }
+            Samples::Wide(samples) => {
+                if let Some(src) = samples.get(range) {
+                    dst.iter_mut().zip(src).for_each(|(d, &s)| *d = s as u8);
+                }
+            }
+        }
+    }
+
     pub(crate) fn copy_row(&self, x: usize, y: usize, dst: &mut [u16]) {
         let start = y * self.width + x;
         let range = start..start + dst.len();

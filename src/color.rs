@@ -343,12 +343,114 @@ impl PixelRgb {
     }
 }
 
+/// A sample type the streaming converter holds rows in: `u8` for 8-bit
+/// pictures (half the memory), `u16` for deeper ones.
+pub(crate) trait BandSample: Copy + Default + Send + Sync + 'static {
+    fn value(self) -> i32;
+    /// Sixteen samples as `u16` lanes.
+    #[cfg(target_arch = "x86_64")]
+    fn lanes16(simd: pulp::x86::V3, s: &[Self; 16]) -> core::arch::x86_64::__m256i;
+    /// Eight samples as `u16` lanes.
+    #[cfg(target_arch = "x86_64")]
+    fn lanes8(simd: pulp::x86::V3, s: &[Self; 8]) -> core::arch::x86_64::__m128i;
+}
+
+impl BandSample for u8 {
+    #[inline(always)]
+    fn value(self) -> i32 {
+        i32::from(self)
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn lanes16(simd: pulp::x86::V3, s: &[u8; 16]) -> core::arch::x86_64::__m256i {
+        simd.avx2._mm256_cvtepu8_epi16(pulp::bytemuck::cast(*s))
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn lanes8(simd: pulp::x86::V3, s: &[u8; 8]) -> core::arch::x86_64::__m128i {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(s);
+        simd.sse4_1._mm_cvtepu8_epi16(pulp::bytemuck::cast(b))
+    }
+}
+
+impl BandSample for u16 {
+    #[inline(always)]
+    fn value(self) -> i32 {
+        i32::from(self)
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn lanes16(_simd: pulp::x86::V3, s: &[u16; 16]) -> core::arch::x86_64::__m256i {
+        pulp::bytemuck::cast(*s)
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn lanes8(_simd: pulp::x86::V3, s: &[u16; 8]) -> core::arch::x86_64::__m128i {
+        pulp::bytemuck::cast(*s)
+    }
+}
+
+/// Where a converted row goes: appended to a `Vec`, or written in place
+/// into an output row.
+pub(crate) trait RowOut {
+    fn push(&mut self, pixel: [u8; 3]);
+    fn push16(&mut self, block: &[[u8; 3]; 16]);
+    /// The next `n` pixels, to be written by the caller.
+    fn next(&mut self, n: usize) -> &mut [[u8; 3]];
+}
+
+impl RowOut for Vec<[u8; 3]> {
+    #[inline(always)]
+    fn push(&mut self, pixel: [u8; 3]) {
+        Vec::push(self, pixel);
+    }
+    #[inline(always)]
+    fn push16(&mut self, block: &[[u8; 3]; 16]) {
+        self.extend_from_slice(block);
+    }
+    fn next(&mut self, n: usize) -> &mut [[u8; 3]] {
+        let start = self.len();
+        self.resize(start + n, [0; 3]);
+        &mut self[start..]
+    }
+}
+
+/// An output row written in place, from its start.
+pub(crate) struct InPlace<'a> {
+    pub(crate) row: &'a mut [[u8; 3]],
+    pub(crate) at: usize,
+}
+
+impl RowOut for InPlace<'_> {
+    #[inline(always)]
+    fn push(&mut self, pixel: [u8; 3]) {
+        if let Some(d) = self.row.get_mut(self.at) {
+            *d = pixel;
+        }
+        self.at += 1;
+    }
+    #[inline(always)]
+    fn push16(&mut self, block: &[[u8; 3]; 16]) {
+        if let Some(d) = self.row.get_mut(self.at..self.at + 16) {
+            d.copy_from_slice(block);
+        }
+        self.at += 16;
+    }
+    fn next(&mut self, n: usize) -> &mut [[u8; 3]] {
+        let start = self.at.min(self.row.len());
+        self.at += n;
+        let end = self.at.min(self.row.len());
+        &mut self.row[start..end]
+    }
+}
+
 impl PixelRgb {
     /// A 4:2:0 row with nearest chroma straight from the samples: pixel `x`
     /// takes chroma sample `x / 2`. Appends whole blocks of 16 pixels to
     /// `out` with the AVX2 kernel and returns how many it did (0 without AVX2,
     /// for identity or monochrome); the caller converts the rest.
-    pub(crate) fn row8_420_nearest(&self, out: &mut Vec<[u8; 3]>, luma: &[u16], cb: &[u16], cr: &[u16]) -> usize {
+    pub(crate) fn row8_420_nearest<O: RowOut, S: BandSample>(&self, out: &mut O, luma: &[S], cb: &[S], cr: &[S]) -> usize {
         #[cfg(target_arch = "x86_64")]
         if !self.matrix.identity
             && !self.monochrome
@@ -362,17 +464,17 @@ impl PixelRgb {
 }
 
 #[cfg(target_arch = "x86_64")]
-struct Row420Avx2<'a> {
+struct Row420Avx2<'a, O, S> {
     simd: pulp::x86::V3,
     m: &'a Matrix,
-    out: &'a mut Vec<[u8; 3]>,
-    luma: &'a [u16],
-    cb: &'a [u16],
-    cr: &'a [u16],
+    out: &'a mut O,
+    luma: &'a [S],
+    cb: &'a [S],
+    cr: &'a [S],
 }
 
 #[cfg(target_arch = "x86_64")]
-impl pulp::NullaryFnOnce for Row420Avx2<'_> {
+impl<O: RowOut, S: BandSample> pulp::NullaryFnOnce for Row420Avx2<'_, O, S> {
     type Output = usize;
 
     #[inline(always)]
@@ -401,14 +503,14 @@ impl pulp::NullaryFnOnce for Row420Avx2<'_> {
         // in the same order, for every pixel.
         let (avx2, low16) = (simd.avx2, avx._mm256_set1_epi32(0xFFFF));
         for ((y, cb), cr) in ys.iter().zip(cbs).zip(crs) {
-            let yv: core::arch::x86_64::__m256i = cast(*y);
+            let yv = S::lanes16(simd, y);
             let scaled = |v| avx._mm256_mul_ps(avx._mm256_sub_ps(avx._mm256_cvtepi32_ps(v), k.y_offset), k.y_scale);
             let (ye, yo) = (scaled(avx2._mm256_and_si256(yv, low16)), scaled(avx2._mm256_srli_epi32::<16>(yv)));
-            let chroma = |c: [u16; 8]| {
-                let c = avx._mm256_cvtepi32_ps(avx2._mm256_cvtepu16_epi32(cast(c)));
+            let chroma = |c: &[S; 8]| {
+                let c = avx._mm256_cvtepi32_ps(avx2._mm256_cvtepu16_epi32(S::lanes8(simd, c)));
                 avx._mm256_mul_ps(avx._mm256_sub_ps(c, k.c_offset), k.c_scale)
             };
-            let (cbf, crf) = (chroma(*cb), chroma(*cr));
+            let (cbf, crf) = (chroma(cb), chroma(cr));
             let (tr, tgb, tgr, tb) =
                 (avx._mm256_mul_ps(k.red_cr, crf), avx._mm256_mul_ps(k.green_cb, cbf), avx._mm256_mul_ps(k.green_cr, crf), avx._mm256_mul_ps(k.blue_cb, cbf));
             let r = to_bytes_even_odd(simd, quantize8_lanes(simd, avx._mm256_add_ps(ye, tr)), quantize8_lanes(simd, avx._mm256_add_ps(yo, tr)));
@@ -423,7 +525,7 @@ impl pulp::NullaryFnOnce for Row420Avx2<'_> {
                 interleave(simd, r, g, b, &masks, 1),
                 interleave(simd, r, g, b, &masks, 2),
             ]);
-            out.extend_from_slice(&block);
+            out.push16(&block);
             done += 16;
         }
         done
