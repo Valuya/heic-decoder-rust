@@ -10,7 +10,7 @@
 use super::cabac::ContextModel;
 
 fn init_array<const N: usize>(values: [u8; N], qp: i32) -> [ContextModel; N] {
-    let mut out = [ContextModel { state: 0, mps: 0 }; N];
+    let mut out = [ContextModel::new(0, 0); N];
     for (o, v) in out.iter_mut().zip(values.iter()) {
         *o = ContextModel::init(*v, qp);
     }
@@ -140,7 +140,7 @@ mod tests {
     fn last_sig_coeff_x_and_y_start_equal_but_are_independent_storage() {
         let mut c = Contexts::init_i_slice(32);
         assert_eq!(c.last_sig_coeff_x_prefix, c.last_sig_coeff_y_prefix);
-        c.last_sig_coeff_x_prefix[0].state = 7;
+        c.last_sig_coeff_x_prefix[0] = ContextModel::new(7, c.last_sig_coeff_x_prefix[0].mps());
         assert_ne!(c.last_sig_coeff_x_prefix[0], c.last_sig_coeff_y_prefix[0]);
     }
 }
