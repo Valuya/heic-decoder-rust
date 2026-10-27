@@ -1104,6 +1104,10 @@ struct Columns {
     /// `Some((lo[0], phase, last))` when column `x` reads chroma
     /// `min(lo[0] + (x + phase) / 2, last)` (4:2:0, nearest), `phase` 0 or 1.
     halves: Option<(usize, usize, usize)>,
+    /// `Some(lo[0])` when column `x` blends chroma `lo[0] + x / 2` and the next
+    /// one with weight 0 (even `x`) or 0.5 (odd `x`), but for the last columns,
+    /// clamped to the last chroma sample (4:2:0, bilinear, co-sited).
+    bilinear_halves: Option<(usize, usize)>,
 }
 
 impl Columns {
@@ -1115,7 +1119,15 @@ impl Columns {
             let last = lo.iter().copied().max().unwrap_or(0);
             (0..2).find(|&phase| lo.iter().enumerate().all(|(x, &l)| l == (lo0 + (x + phase) / 2).min(last))).map(|phase| (lo0, phase, last))
         });
-        Columns { lo, hi: get(|e| e.hi), weight: axis.entries.iter().map(|e| e.map_or(0.0, |e| e.weight)).collect(), halves }
+        let (hi, weight): (Vec<usize>, Vec<f32>) = (get(|e| e.hi), axis.entries.iter().map(|e| e.map_or(0.0, |e| e.weight)).collect());
+        let last_hi = hi.iter().copied().max().unwrap_or(0);
+        let bilinear_halves = lo.first().copied().filter(|_| axis.entries.iter().all(Option::is_some)).map(|lo0| (lo0, last_hi)).filter(|&(lo0, last)| {
+            lo.iter().zip(&hi).zip(&weight).enumerate().all(|(x, ((&l, &h), &w))| {
+                let (el, eh) = ((lo0 + x / 2).min(last), (lo0 + x / 2 + 1).min(last));
+                l == el && h == eh && w == if x % 2 == 1 && el != eh { 0.5 } else { 0.0 }
+            })
+        });
+        Columns { lo, hi, weight, halves, bilinear_halves }
     }
 }
 
@@ -1210,7 +1222,15 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
         let (h_cb, h_cr) = (across(cb_lo, cb_hi), across(cr_lo, cr_hi));
         let pick = |h: &[f32], i: usize| h.get(i).copied().unwrap_or(0.0);
         let blend = |h: &[f32]| -> Vec<f32> {
-            columns.lo.iter().zip(&columns.hi).zip(&columns.weight).map(|((&lo, &hi), &w)| PixelRgb::lerp_rows(pick(h, lo), pick(h, hi), w)).collect()
+            let mut out = Vec::with_capacity(columns.lo.len());
+            if let Some((lo0, last)) = columns.bilinear_halves {
+                crate::color::blend_halves(&mut out, h.get(lo0..=last).unwrap_or(&[]), columns.lo.len());
+            }
+            let done = out.len();
+            out.extend(
+                columns.lo.iter().zip(&columns.hi).zip(&columns.weight).skip(done).map(|((&lo, &hi), &w)| PixelRgb::lerp_rows(pick(h, lo), pick(h, hi), w)),
+            );
+            out
         };
         (blend(&h_cb), blend(&h_cr))
     } else {
