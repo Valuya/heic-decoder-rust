@@ -100,41 +100,41 @@ pub struct Plane {
     pub height: usize,
     pub bit_depth: u32,
     samples: Samples,
-    /// One bit per sample, row-major: set once the CTU decode driver has
-    /// written it.
-    decoded: Vec<u64>,
-}
-
-/// Sets bits `start..start + len`, all inside `bits`.
-fn mark_decoded(bits: &mut [u64], start: usize, len: usize) {
-    let end = start + len;
-    let mut at = start;
-    while at < end {
-        let (word, bit) = (at / 64, at % 64);
-        let take = (64 - bit).min(end - at);
-        let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
-        if let Some(w) = bits.get_mut(word) {
-            *w |= mask;
-        }
-        at += take;
-    }
+    /// One byte per 4x4 unit, row-major, set once the CTU decode driver has
+    /// written the unit (every block is a whole number of units).
+    decoded: Vec<u8>,
+    /// Units per row of `decoded`.
+    units_w: usize,
 }
 
 impl Plane {
     fn empty() -> Self {
-        Plane { width: 0, height: 0, bit_depth: 8, samples: Samples::Narrow(Vec::new()), decoded: Vec::new() }
+        Plane { width: 0, height: 0, bit_depth: 8, samples: Samples::Narrow(Vec::new()), decoded: Vec::new(), units_w: 0 }
     }
 
     /// `width x height` zeros, none decoded, keeping the buffers.
     fn reset(&mut self, width: usize, height: usize, bit_depth: u32) {
         (self.width, self.height, self.bit_depth) = (width, height, bit_depth);
         self.samples.reset(bit_depth, width * height);
+        self.units_w = width.div_ceil(4);
         self.decoded.clear();
-        self.decoded.resize((width * height).div_ceil(64), 0);
+        self.decoded.resize(self.units_w * height.div_ceil(4), 0);
     }
 
-    fn is_decoded(&self, index: usize) -> bool {
-        self.decoded.get(index / 64).is_some_and(|word| word >> (index % 64) & 1 != 0)
+    #[inline(always)]
+    fn is_decoded(&self, x: usize, y: usize) -> bool {
+        self.decoded.get((y / 4) * self.units_w + x / 4).is_some_and(|&u| u != 0)
+    }
+
+    /// Marks the units covering the `w x h` block at `(x0, y0)` decoded.
+    #[inline(always)]
+    fn mark_decoded(&mut self, x0: usize, y0: usize, w: usize, h: usize) {
+        let (ux0, ux1) = (x0 / 4, (x0 + w).div_ceil(4).min(self.units_w));
+        for uy in y0 / 4..(y0 + h).div_ceil(4) {
+            if let Some(row) = self.decoded.get_mut(uy * self.units_w + ux0..uy * self.units_w + ux1) {
+                row.fill(1);
+            }
+        }
     }
 
     fn get(&self, x: i64, y: i64) -> Option<i32> {
@@ -142,7 +142,75 @@ impl Plane {
             return None;
         }
         let idx = y as usize * self.width + x as usize;
-        if self.is_decoded(idx) { self.samples.get(idx) } else { None }
+        if self.is_decoded(x as usize, y as usize) { self.samples.get(idx) } else { None }
+    }
+
+    /// Intra border samples straight from the plane, in [`Border`]'s order
+    /// (left column bottom to top, corner, top row left to right), with
+    /// `avail` set where a sample is: in the picture, at or below `start_y`
+    /// and decoded. Blocks are 4-aligned, so availability is checked once per
+    /// 4 samples. `false` (nothing written) for a block that is not.
+    pub(crate) fn border_into(&self, x0: usize, y0: usize, nt: usize, start_y: usize, data: &mut [i32], avail: &mut [bool]) -> bool {
+        if nt < 4
+            || !x0.is_multiple_of(4)
+            || !y0.is_multiple_of(4)
+            || !self.width.is_multiple_of(4)
+            || !self.height.is_multiple_of(4)
+            || data.len() < 4 * nt + 1
+            || avail.len() < 4 * nt + 1
+        {
+            return false;
+        }
+        match &self.samples {
+            Samples::Narrow(s) => self.border_groups(s, x0, y0, nt, start_y, data, avail),
+            Samples::Wide(s) => self.border_groups(s, x0, y0, nt, start_y, data, avail),
+        }
+        true
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn border_groups<T: Sample>(&self, s: &[T], x0: usize, y0: usize, nt: usize, start_y: usize, data: &mut [i32], avail: &mut [bool]) {
+        let w = self.width;
+        let available = |x: usize, y: usize| y >= start_y && x < w && y < self.height && self.is_decoded(x, y);
+        let n2 = 2 * nt;
+        if x0 > 0 {
+            let x = x0 - 1;
+            // left column, group g: rows y0 + 2nt - 1 - 4g down to y0 + 2nt - 4 - 4g
+            for g in 0..n2 / 4 {
+                let y_low = y0 + n2 - 4 - 4 * g;
+                if available(x, y_low) {
+                    for j in 0..4 {
+                        let k = 4 * g + j;
+                        if let Some(&v) = s.get((y0 + n2 - 1 - k) * w + x) {
+                            data[k] = v.into();
+                            avail[k] = true;
+                        }
+                    }
+                }
+            }
+            if y0 > 0
+                && available(x, y0 - 1)
+                && let Some(&v) = s.get((y0 - 1) * w + x)
+            {
+                data[n2] = v.into();
+                avail[n2] = true;
+            }
+        }
+        if y0 > 0 {
+            let row = (y0 - 1) * w;
+            for g in 0..n2 / 4 {
+                let x = x0 + 4 * g;
+                if available(x, y0 - 1)
+                    && let Some(src) = s.get(row + x..row + x + 4)
+                {
+                    for (j, &v) in src.iter().enumerate() {
+                        data[n2 + 1 + 4 * g + j] = v.into();
+                        avail[n2 + 1 + 4 * g + j] = true;
+                    }
+                }
+            }
+        }
     }
 
     /// Post-reconstruction passes (deblocking, SAO) only ever run after
@@ -175,7 +243,7 @@ impl Plane {
         }
         let idx = y * self.width + x;
         self.samples.set(idx, v).ok_or(HeifError::MalformedHevc("plane write out of bounds"))?;
-        mark_decoded(&mut self.decoded, idx, 1);
+        self.mark_decoded(x, y, 1, 1);
         Ok(())
     }
 
@@ -196,9 +264,29 @@ impl Plane {
                     samples.get_mut(start..start + n).ok_or_else(out_of_bounds)?.iter_mut().zip(source).for_each(|(d, &s)| *d = u16::narrow(s))
                 }
             }
-            mark_decoded(&mut self.decoded, start, n);
         }
+        self.mark_decoded(x0, y0, n, n);
         Ok(())
+    }
+
+    /// For an 8-bit plane: writes `pred + res` clipped to 0..=255 (the
+    /// saturating packs are exactly that clip) and marks it decoded, with
+    /// AVX2/SSE4.1; `false` (nothing written) when it cannot.
+    fn write_block_sum8(&mut self, x0: usize, y0: usize, n: usize, pred: &[i32], res: &[i32]) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if self.bit_depth == 8 && (n == 4 || n.is_multiple_of(8)) && x0 + n <= self.width && y0 + n <= self.height && pred.len() >= n * n && res.len() >= n * n
+        {
+            let width = self.width;
+            if let (Samples::Narrow(samples), Some(simd)) = (&mut self.samples, pulp::x86::V3::try_new())
+                && samples.len() >= (y0 + n - 1) * width + x0 + n
+            {
+                simd.vectorize(SumWrite { simd, samples, width, x0, y0, n, pred, res });
+                self.mark_decoded(x0, y0, n, n);
+                return true;
+            }
+        }
+        let _ = (x0, y0, n, pred, res);
+        false
     }
 
     pub fn into_samples(self) -> Vec<i32> {
@@ -663,6 +751,7 @@ struct Decoder<'e, 'b, 'c> {
 /// Working buffers for one transform block, sized for the largest (32x32)
 /// and reused for every block instead of allocating per block.
 struct BlockScratch {
+    border: Border,
     pred: [i32; 32 * 32],
     coeffs: [i32; 32 * 32],
     dequantized: [i32; 32 * 32],
@@ -676,7 +765,7 @@ fn block(buf: &mut [i32], nt: usize) -> Result<&mut [i32]> {
 
 impl BlockScratch {
     fn new() -> Box<Self> {
-        Box::new(BlockScratch { pred: [0; 32 * 32], coeffs: [0; 32 * 32], dequantized: [0; 32 * 32], residual: [0; 32 * 32] })
+        Box::new(BlockScratch { border: Border::empty(), pred: [0; 32 * 32], coeffs: [0; 32 * 32], dequantized: [0; 32 * 32], residual: [0; 32 * 32] })
     }
 }
 
@@ -1397,14 +1486,20 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
             let timer = timing::start(Stage::Intra);
             if self.current_intra {
                 let start_y = pic.slice_start_y / if cidx == 0 { 1 } else { self.sps.sub_height_c() as usize };
-                let mut border = Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) })?;
+                let border = &mut scratch.border;
+                border.fill(
+                    nt,
+                    bit_depth,
+                    |data, avail| plane.border_into(x0, y0, nt, start_y, data, avail),
+                    || Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) }),
+                )?;
                 if is_luma_or_444 {
                     border.filter(nt, cidx, mode, bit_depth, self.sps.strong_intra_smoothing_enabled)?;
                 }
                 match mode {
-                    0 => predict_planar(pred, nt, &border)?,
-                    1 => predict_dc(pred, nt, cidx, &border)?,
-                    _ => predict_angular(pred, nt, cidx, mode, bit_depth, false, &border)?,
+                    0 => predict_planar(pred, nt, border)?,
+                    1 => predict_dc(pred, nt, cidx, border)?,
+                    _ => predict_angular(pred, nt, cidx, mode, bit_depth, false, border)?,
                 }
             } else {
                 for y in 0..nt {
@@ -1515,6 +1610,14 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 }
                 drop(timer);
                 let _timer = timing::start(Stage::Write);
+                let plane = match cidx {
+                    0 => &mut pic.y,
+                    1 => &mut pic.cb,
+                    _ => &mut pic.cr,
+                };
+                if plane.write_block_sum8(x0, y0, nt, pred, res) {
+                    return Ok(());
+                }
                 let max = (1i32 << bit_depth) - 1;
                 for (p, &r) in pred.iter_mut().zip(res.iter()) {
                     *p = (*p + r).clamp(0, max);
@@ -1723,6 +1826,54 @@ pub(crate) fn decode_slice_rows(
     }
     pic.slice_start_y = 0;
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+struct SumWrite<'a> {
+    simd: pulp::x86::V3,
+    samples: &'a mut [u8],
+    width: usize,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    pred: &'a [i32],
+    res: &'a [i32],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for SumWrite<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn call(self) {
+        use core::arch::x86_64::{__m128i, __m256i};
+        use pulp::bytemuck::cast;
+        let SumWrite { simd, samples, width, x0, y0, n, pred, res } = self;
+        let (sse2, sse41, avx, avx2) = (simd.sse2, simd.sse4_1, simd.avx, simd.avx2);
+        for row in 0..n {
+            let start = (y0 + row) * width + x0;
+            let (p, r) = (&pred[row * n..row * n + n], &res[row * n..row * n + n]);
+            let dst = &mut samples[start..start + n];
+            if n == 4 {
+                let (p4, r4): ([i32; 4], [i32; 4]) = (p.try_into().unwrap_or([0; 4]), r.try_into().unwrap_or([0; 4]));
+                let sum = sse2._mm_add_epi32(cast::<[i32; 4], __m128i>(p4), cast::<[i32; 4], __m128i>(r4));
+                let w16 = sse41._mm_packus_epi32(sum, sum);
+                let b = sse2._mm_packus_epi16(w16, w16);
+                let bytes: [u8; 16] = cast(b);
+                dst.copy_from_slice(&bytes[..4]);
+            } else {
+                let (p8, r8, d8) = (p.as_chunks::<8>().0, r.as_chunks::<8>().0, dst.as_chunks_mut::<8>().0);
+                for ((d, p), r) in d8.iter_mut().zip(p8).zip(r8) {
+                    let sum = avx2._mm256_add_epi32(cast::<[i32; 8], __m256i>(*p), cast::<[i32; 8], __m256i>(*r));
+                    let (lo, hi) = (avx._mm256_castsi256_si128(sum), avx2._mm256_extracti128_si256::<1>(sum));
+                    let w16 = sse41._mm_packus_epi32(lo, hi);
+                    let b = sse2._mm_packus_epi16(w16, w16);
+                    let bytes: [u8; 16] = cast(b);
+                    d.copy_from_slice(&bytes[..8]);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
