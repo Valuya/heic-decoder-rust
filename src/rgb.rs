@@ -959,7 +959,7 @@ trait Tiles {
 /// never wait for a row to finish, and conversion overlaps decoding.
 struct Ahead<'s, 'p> {
     scope: &'s rayon::Scope<'p>,
-    images: &'p [ResolvedImage],
+    images: &'p [ResolvedImage<'p>],
     pool: &'p PicturePool,
     window: usize,
     sender: mpsc::Sender<(usize, Result<Tile>)>,
@@ -1000,7 +1000,7 @@ impl Tiles for Ahead<'_, '_> {
 /// Tiles decoded a few at a time (one per thread) by the caller: with one
 /// thread, or when the caller is itself on rayon's pool.
 struct Chunked<'p> {
-    images: &'p [ResolvedImage],
+    images: &'p [ResolvedImage<'p>],
     pool: &'p PicturePool,
     threads: usize,
     pending: BTreeMap<usize, Tile>,

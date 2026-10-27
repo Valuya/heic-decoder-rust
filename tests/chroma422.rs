@@ -39,12 +39,12 @@ fn independent_slices_require_complete_ordered_picture() {
     let original = image.data.clone();
     // Keep valid syntax, but remove the final slice: no silent partial image.
     let last = nalus[slice_indices[2]].len() + size;
-    image.data.truncate(original.len() - last);
+    image.data.to_mut().truncate(original.len() - last);
     assert!(decode_one_image(&image).is_err());
     // Repeat a slice address: overlapping reconstruction is invalid.
     image.data = original;
     let duplicate = &nalus[slice_indices[1]];
-    image.data.extend_from_slice(&(duplicate.len() as u32).to_be_bytes());
-    image.data.extend_from_slice(duplicate);
+    image.data.to_mut().extend_from_slice(&(duplicate.len() as u32).to_be_bytes());
+    image.data.to_mut().extend_from_slice(duplicate);
     assert!(decode_one_image(&image).is_err());
 }
