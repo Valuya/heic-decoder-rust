@@ -550,7 +550,7 @@ impl Sink {
                 let run = Scatter::span(&scatter.row_t[first..first + converted.len()]).filter(|&(start, _, len, _)| start == 0 && len == converted.len());
                 // Turned, blocks of eight transformed rows reading eight consecutive
                 // source columns: transposed eight source rows at a time.
-                if let (true, None, Some((_, t0, len, reversed)), false) = (scatter.turned, alpha, run, *NO_TURN_BLOCKS) {
+                if let (true, None, Some((_, t0, len, reversed))) = (scatter.turned, alpha, run) {
                     let start = touched.start;
                     data[touched.start * row..touched.end * row].par_chunks_mut(row * 8).enumerate().for_each(|(b, block)| {
                         let ty0 = start + 8 * b;
@@ -1292,9 +1292,7 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
         }
         return out;
     }
-    if let Some((lo0, phase, last)) = columns.halves
-        && std::env::var("HEIC_NO_FUSED").as_deref() != Ok("1")
-    {
+    if let Some((lo0, phase, last)) = columns.halves {
         let (cb_row, cr_row) = (cb.get(ry.lo), cr.get(ry.lo));
         let chroma = |x: usize| {
             let c = columns.lo.get(x).copied().unwrap_or(0);
@@ -1399,6 +1397,3 @@ mod tests {
         assert_eq!(bins.finish().data, [0, 10, 255, 200, 10, 255]);
     }
 }
-
-/// `HEIC_NO_TURN_BLOCKS=1`: gather turned rows pixel by pixel (A/B runs).
-static NO_TURN_BLOCKS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_TURN_BLOCKS").as_deref() == Ok("1"));
