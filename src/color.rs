@@ -462,6 +462,92 @@ fn to_bytes_even_odd(simd: pulp::x86::V3, even: core::arch::x86_64::__m256i, odd
 #[cfg(target_arch = "x86_64")]
 static EVEN_ODD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_EVEN_ODD").as_deref() != Ok("1"));
 
+/// Turned output: `dst[j][t(k)] = src[k][x0 + j]` for the eight rows `dst`
+/// and the source rows `src`, eight at a time as 8x8 blocks of RGB pixels
+/// (each widened to 32 bits by a byte shuffle, transposed, packed back);
+/// `t(k)` is `k`, or `len - 1 - k` when `reversed`. Returns how many source
+/// rows it did (whole blocks of eight); the caller does the rest. `false`
+/// cases (no AVX2, rows too short) do nothing.
+pub(crate) fn turn_rgb_8rows(dst: &mut [&mut [[u8; 3]]; 8], src: &[Vec<[u8; 3]>], x0: usize, reversed: bool) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if *AVX2 {
+        if let Some(simd) = pulp::x86::V3::try_new() {
+            return simd.vectorize(TurnRgb { simd, dst, src, x0, reversed });
+        }
+    }
+    let _ = (dst, src, x0, reversed);
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+struct TurnRgb<'a, 'b> {
+    simd: pulp::x86::V3,
+    dst: &'a mut [&'b mut [[u8; 3]]; 8],
+    src: &'a [Vec<[u8; 3]>],
+    x0: usize,
+    reversed: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for TurnRgb<'_, '_> {
+    type Output = usize;
+
+    #[inline(always)]
+    fn call(self) -> usize {
+        use core::arch::x86_64::{__m128i, __m256i};
+        use pulp::bytemuck::{cast, cast_slice};
+        let TurnRgb { simd, dst, src, x0, reversed } = self;
+        let (avx, avx2) = (simd.avx, simd.avx2);
+        let len = src.len();
+        if dst.iter().any(|d| d.len() < len) || src.iter().any(|r| r.len() < x0 + 8) {
+            return 0;
+        }
+        // lane 0: pixels 0-3 from bytes 0..12; lane 1: pixels 4-7, at 4..16 of a load from byte 8
+        let widen: __m256i = cast([0i8, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1, 4, 5, 6, -1, 7, 8, 9, -1, 10, 11, 12, -1, 13, 14, 15, -1]);
+        let narrow: __m256i = cast([0i8, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1, 0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1]);
+        let flip = avx._mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+        let mut k0 = 0;
+        while k0 + 8 <= len {
+            let mut r = [avx._mm256_setzero_si256(); 8];
+            for (i, r) in r.iter_mut().enumerate() {
+                let bytes: &[u8] = cast_slice(&src[k0 + i][x0..x0 + 8]);
+                let lo: [u8; 16] = bytes[0..16].try_into().unwrap_or([0; 16]);
+                let hi: [u8; 16] = bytes[8..24].try_into().unwrap_or([0; 16]);
+                let both = avx._mm256_set_m128i(cast::<[u8; 16], __m128i>(hi), cast::<[u8; 16], __m128i>(lo));
+                *r = avx2._mm256_shuffle_epi8(both, widen);
+            }
+            let t = [
+                avx2._mm256_unpacklo_epi32(r[0], r[1]), avx2._mm256_unpackhi_epi32(r[0], r[1]),
+                avx2._mm256_unpacklo_epi32(r[2], r[3]), avx2._mm256_unpackhi_epi32(r[2], r[3]),
+                avx2._mm256_unpacklo_epi32(r[4], r[5]), avx2._mm256_unpackhi_epi32(r[4], r[5]),
+                avx2._mm256_unpacklo_epi32(r[6], r[7]), avx2._mm256_unpackhi_epi32(r[6], r[7]),
+            ];
+            let u = [
+                avx2._mm256_unpacklo_epi64(t[0], t[2]), avx2._mm256_unpackhi_epi64(t[0], t[2]),
+                avx2._mm256_unpacklo_epi64(t[1], t[3]), avx2._mm256_unpackhi_epi64(t[1], t[3]),
+                avx2._mm256_unpacklo_epi64(t[4], t[6]), avx2._mm256_unpackhi_epi64(t[4], t[6]),
+                avx2._mm256_unpacklo_epi64(t[5], t[7]), avx2._mm256_unpackhi_epi64(t[5], t[7]),
+            ];
+            let cols = [
+                avx2._mm256_permute2x128_si256::<0x20>(u[0], u[4]), avx2._mm256_permute2x128_si256::<0x20>(u[1], u[5]),
+                avx2._mm256_permute2x128_si256::<0x20>(u[2], u[6]), avx2._mm256_permute2x128_si256::<0x20>(u[3], u[7]),
+                avx2._mm256_permute2x128_si256::<0x31>(u[0], u[4]), avx2._mm256_permute2x128_si256::<0x31>(u[1], u[5]),
+                avx2._mm256_permute2x128_si256::<0x31>(u[2], u[6]), avx2._mm256_permute2x128_si256::<0x31>(u[3], u[7]),
+            ];
+            let at = if reversed { len - k0 - 8 } else { k0 };
+            for (j, col) in cols.into_iter().enumerate() {
+                let col = if reversed { avx2._mm256_permutevar8x32_epi32(col, flip) } else { col };
+                let packed: [u8; 32] = cast(avx2._mm256_shuffle_epi8(col, narrow));
+                let out: &mut [u8] = pulp::bytemuck::cast_slice_mut(&mut dst[j][at..at + 8]);
+                out[0..12].copy_from_slice(&packed[0..12]);
+                out[12..24].copy_from_slice(&packed[16..28]);
+            }
+            k0 += 8;
+        }
+        k0
+    }
+}
+
 /// Eight chroma samples, each repeated for two pixels, as two vectors of
 /// eight `f32` lanes.
 #[cfg(target_arch = "x86_64")]

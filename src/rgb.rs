@@ -548,6 +548,37 @@ impl Sink {
                 // Turned, a batch whose rows land on one run of transformed
                 // columns: each transformed row gathers one source column.
                 let run = Scatter::span(&scatter.row_t[first..first + converted.len()]).filter(|&(start, _, len, _)| start == 0 && len == converted.len());
+                // Turned, blocks of eight transformed rows reading eight consecutive
+                // source columns: transposed eight source rows at a time.
+                if let (true, None, Some((_, t0, len, reversed)), false) = (scatter.turned, alpha, run, *NO_TURN_BLOCKS) {
+                    let start = touched.start;
+                    data[touched.start * row..touched.end * row].par_chunks_mut(row * 8).enumerate().for_each(|(b, block)| {
+                        let ty0 = start + 8 * b;
+                        let x0 = scatter.source_of_row.get(ty0).copied().flatten();
+                        let consecutive = block.len() == row * 8
+                            && x0.is_some_and(|x0| (0..8).all(|j| scatter.source_of_row.get(ty0 + j).copied().flatten() == Some(x0 + j)));
+                        let mut rows: Vec<&mut [[u8; 3]]> = block.chunks_mut(row).map(|r| r.as_chunks_mut::<3>().0).collect();
+                        let mut done = 0;
+                        if let (true, Some(x0)) = (consecutive, x0)
+                            && let Ok(mut eight) = <[&mut [[u8; 3]]; 8]>::try_from(rows.iter_mut().map(|r| &mut r[t0..t0 + len]).collect::<Vec<_>>())
+                        {
+                            done = crate::color::turn_rgb_8rows(&mut eight, converted, x0, reversed);
+                        }
+                        // the rest (rows not in a whole block, source rows past the last block of eight)
+                        for (j, out) in rows.iter_mut().enumerate() {
+                            let Some(x) = scatter.source_of_row.get(ty0 + j).copied().flatten() else { continue };
+                            let Some(dst) = out.get_mut(t0..t0 + len) else { continue };
+                            let skip = if consecutive { done } else { 0 };
+                            for (k, src) in converted.iter().enumerate().skip(skip) {
+                                let t = if reversed { len - 1 - k } else { k };
+                                if let (Some(d), Some(s)) = (dst.get_mut(t), src.get(x)) {
+                                    *d = *s;
+                                }
+                            }
+                        }
+                    });
+                    return;
+                }
                 data[touched.start * row..touched.end * row].par_chunks_mut(row).zip(touched).for_each(|(out, ty)| {
                     if let (true, None, Some((_, t0, len, reversed))) = (scatter.turned, alpha, run) {
                         let Some(x) = scatter.source_of_row[ty] else { return };
@@ -1368,3 +1399,6 @@ mod tests {
         assert_eq!(bins.finish().data, [0, 10, 255, 200, 10, 255]);
     }
 }
+
+/// `HEIC_NO_TURN_BLOCKS=1`: gather turned rows pixel by pixel (A/B runs).
+static NO_TURN_BLOCKS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_TURN_BLOCKS").as_deref() == Ok("1"));
