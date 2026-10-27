@@ -391,6 +391,43 @@ impl pulp::NullaryFnOnce for Row420Avx2<'_> {
         let (cbs, _) = cb.as_chunks::<8>();
         let (crs, _) = cr.as_chunks::<8>();
         let mut done = 0;
+        if *EVEN_ODD {
+            // Even and odd pixels apart: each pair shares its chroma sample, so the
+            // chroma terms are computed once, on eight lanes. Same f32 operations,
+            // in the same order, for every pixel.
+            let (avx2, low16) = (simd.avx2, avx._mm256_set1_epi32(0xFFFF));
+            for ((y, cb), cr) in ys.iter().zip(cbs).zip(crs) {
+                let yv: core::arch::x86_64::__m256i = cast(*y);
+                let scaled = |v| avx._mm256_mul_ps(avx._mm256_sub_ps(avx._mm256_cvtepi32_ps(v), k.y_offset), k.y_scale);
+                let (ye, yo) = (scaled(avx2._mm256_and_si256(yv, low16)), scaled(avx2._mm256_srli_epi32::<16>(yv)));
+                let chroma = |c: [u16; 8]| {
+                    let c = avx._mm256_cvtepi32_ps(avx2._mm256_cvtepu16_epi32(cast(c)));
+                    avx._mm256_mul_ps(avx._mm256_sub_ps(c, k.c_offset), k.c_scale)
+                };
+                let (cbf, crf) = (chroma(*cb), chroma(*cr));
+                let (tr, tgb, tgr, tb) = (
+                    avx._mm256_mul_ps(k.red_cr, crf),
+                    avx._mm256_mul_ps(k.green_cb, cbf),
+                    avx._mm256_mul_ps(k.green_cr, crf),
+                    avx._mm256_mul_ps(k.blue_cb, cbf),
+                );
+                let r = to_bytes_even_odd(simd, quantize8_lanes(simd, avx._mm256_add_ps(ye, tr)), quantize8_lanes(simd, avx._mm256_add_ps(yo, tr)));
+                let g = to_bytes_even_odd(
+                    simd,
+                    quantize8_lanes(simd, avx._mm256_add_ps(avx._mm256_add_ps(ye, tgb), tgr)),
+                    quantize8_lanes(simd, avx._mm256_add_ps(avx._mm256_add_ps(yo, tgb), tgr)),
+                );
+                let b = to_bytes_even_odd(simd, quantize8_lanes(simd, avx._mm256_add_ps(ye, tb)), quantize8_lanes(simd, avx._mm256_add_ps(yo, tb)));
+                let block = cast::<[__m128i; 3], [[u8; 3]; 16]>([
+                    interleave(simd, r, g, b, &masks, 0),
+                    interleave(simd, r, g, b, &masks, 1),
+                    interleave(simd, r, g, b, &masks, 2),
+                ]);
+                out.extend_from_slice(&block);
+                done += 16;
+            }
+            return done;
+        }
         for ((y, cb), cr) in ys.iter().zip(cbs).zip(crs) {
             let [y0, y1]: [[u16; 8]; 2] = cast(*y);
             let (y0, y1) = (simd.avx2._mm256_cvtepu16_epi32(cast(y0)), simd.avx2._mm256_cvtepu16_epi32(cast(y1)));
@@ -410,6 +447,20 @@ impl pulp::NullaryFnOnce for Row420Avx2<'_> {
         done
     }
 }
+
+/// Even and odd pixels' 0..=255 lanes as 16 bytes in pixel order: the 32-bit
+/// unpacks give pixels 0-3 and 8-11, 4-7 and 12-15, which the packs put in order.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn to_bytes_even_odd(simd: pulp::x86::V3, even: core::arch::x86_64::__m256i, odd: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m128i {
+    let avx2 = simd.avx2;
+    let p16 = avx2._mm256_packus_epi32(avx2._mm256_unpacklo_epi32(even, odd), avx2._mm256_unpackhi_epi32(even, odd));
+    simd.sse2._mm_packus_epi16(simd.avx._mm256_castsi256_si128(p16), avx2._mm256_extracti128_si256::<1>(p16))
+}
+
+/// `HEIC_NO_EVEN_ODD=1`: the kernel with doubled chroma lanes (A/B runs).
+#[cfg(target_arch = "x86_64")]
+static EVEN_ODD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_EVEN_ODD").as_deref() != Ok("1"));
 
 /// Eight chroma samples, each repeated for two pixels, as two vectors of
 /// eight `f32` lanes.
