@@ -24,7 +24,7 @@ use std::sync::mpsc;
 
 use rayon::prelude::*;
 
-use crate::color::{Axis, ChromaSampling, ColorInfo, PixelRgb, RgbImage, RgbOptions, alpha8, axis};
+use crate::color::{Axis, BandSample, ChromaSampling, ColorInfo, PixelRgb, RgbImage, RgbOptions, alpha8, axis};
 use crate::error::{HeifError, Result};
 use crate::hevc::ctu::Picture;
 use crate::hevc::nal::NAL_SPS;
@@ -784,12 +784,29 @@ struct Tile {
 }
 
 /// One row of tiles laid out as source rows, as `blit_tiles` places them on
-/// the canvas: zeros where no tile reaches. Samples fit `u16` (bit depths
-/// are at most 16), half the memory of the decoder's `i32`.
-struct Band {
-    luma: Vec<Vec<u16>>,
-    cb: Vec<Vec<u16>>,
-    cr: Vec<Vec<u16>>,
+/// the canvas: zeros where no tile reaches. Samples are `u8` for 8-bit
+/// pictures and `u16` for deeper ones (bit depths are at most 16).
+struct Band<S> {
+    luma: Vec<Vec<S>>,
+    cb: Vec<Vec<S>>,
+    cr: Vec<Vec<S>>,
+}
+
+/// A band sample type that rows of a decoded plane copy into.
+trait PlaneRow: BandSample {
+    fn copy(plane: &crate::hevc::ctu::Plane, x: usize, y: usize, dst: &mut [Self]);
+}
+
+impl PlaneRow for u8 {
+    fn copy(plane: &crate::hevc::ctu::Plane, x: usize, y: usize, dst: &mut [u8]) {
+        plane.copy_row_narrow(x, y, dst);
+    }
+}
+
+impl PlaneRow for u16 {
+    fn copy(plane: &crate::hevc::ctu::Plane, x: usize, y: usize, dst: &mut [u16]) {
+        plane.copy_row(x, y, dst);
+    }
 }
 
 /// The canvas layout bands are cut from.
@@ -806,18 +823,18 @@ struct Layout {
 impl Layout {
     /// Band `index`'s rows, reusing `spare` rows where there are (every
     /// sample of a band row is placed from a tile, so reused rows need no clearing).
-    fn band(&self, index: usize, spare: [&mut Vec<Vec<u16>>; 3]) -> Band {
+    fn band<S: BandSample>(&self, index: usize, spare: [&mut Vec<Vec<S>>; 3]) -> Band<S> {
         let rows = self.tile.height.min(self.height.saturating_sub(index * self.tile.height));
         let c_rows = if self.tile.format == 0 { 0 } else { rows.div_ceil(self.sub_h) };
         let [sl, sb, sr] = spare;
-        let take = |spare: &mut Vec<Vec<u16>>, n: usize, width: usize| -> Vec<Vec<u16>> {
+        let take = |spare: &mut Vec<Vec<S>>, n: usize, width: usize| -> Vec<Vec<S>> {
             (0..n)
                 .map(|_| match spare.pop() {
                     Some(mut r) => {
-                        r.resize(width, 0);
+                        r.resize(width, S::default());
                         r
                     }
-                    None => vec![0; width],
+                    None => vec![S::default(); width],
                 })
                 .collect()
         };
@@ -826,40 +843,40 @@ impl Layout {
 
     /// Copies the tile in column `column` into `band`, straight from the
     /// decoded picture's planes.
-    fn place(&self, band: &mut Band, column: usize, tile: &Tile) {
+    fn place<S: PlaneRow>(&self, band: &mut Band<S>, column: usize, tile: &Tile) {
         let x0 = column * self.tile.width;
         let w = self.tile.width.min(self.width.saturating_sub(x0));
         if w == 0 {
             return;
         }
         for (r, row) in band.luma.iter_mut().enumerate() {
-            tile.pic.y.copy_row(tile.left, tile.top + r, &mut row[x0..x0 + w]);
+            S::copy(&tile.pic.y, tile.left, tile.top + r, &mut row[x0..x0 + w]);
         }
         let (cx, cw) = (x0 / self.sub_w, w.div_ceil(self.sub_w));
         let (left, top) = (tile.left / self.sub_w, tile.top / self.sub_h);
         for (r, (row_cb, row_cr)) in band.cb.iter_mut().zip(band.cr.iter_mut()).enumerate() {
-            tile.pic.cb.copy_row(left, top + r, &mut row_cb[cx..cx + cw]);
-            tile.pic.cr.copy_row(left, top + r, &mut row_cr[cx..cx + cw]);
+            S::copy(&tile.pic.cb, left, top + r, &mut row_cb[cx..cx + cw]);
+            S::copy(&tile.pic.cr, left, top + r, &mut row_cr[cx..cx + cw]);
         }
     }
 }
 
 /// Source rows held for conversion, `first..first + rows.len()`.
-struct Rows {
+struct Rows<S> {
     first: usize,
-    rows: VecDeque<Vec<u16>>,
+    rows: VecDeque<Vec<S>>,
     /// Rows dropped below the converted ones, reused for the next bands.
-    spare: Vec<Vec<u16>>,
+    spare: Vec<Vec<S>>,
 }
 
-impl Rows {
+impl<S> Rows<S> {
     fn new() -> Self {
         Rows { first: 0, rows: VecDeque::new(), spare: Vec::new() }
     }
     fn end(&self) -> usize {
         self.first + self.rows.len()
     }
-    fn get(&self, row: usize) -> &[u16] {
+    fn get(&self, row: usize) -> &[S] {
         row.checked_sub(self.first).and_then(|i| self.rows.get(i)).map_or(&[], Vec::as_slice)
     }
     fn drop_below(&mut self, row: usize) {
@@ -1088,7 +1105,43 @@ fn convert(
         Sink::bins(full, out, [AxisMap::identity(full.0, out.0, 1), AxisMap::identity(full.1, out.1, out.0)])?
     };
 
-    let (mut luma, mut cb, mut cr) = (Rows::new(), Rows::new(), Rows::new());
+    let plan = Plan { layout, shape, rows, columns, needs: &needs, keep_from: &keep_from, height, flat, turned, options, alpha: alpha.as_ref(), scatter: &scatter, column_arrays: &column_arrays, rows_axis: &rows_axis, pixel: &pixel };
+    let converted = if shape.bit_depth_luma <= 8 && shape.bit_depth_chroma <= 8 && !*WIDE_BANDS {
+        convert_bands::<u8>(&plan, first, tiles, pool, &mut sink)?
+    } else {
+        convert_bands::<u16>(&plan, first, tiles, pool, &mut sink)?
+    };
+    if converted.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(sink.finish()))
+}
+
+/// What [`convert_bands`] needs from [`convert`]'s setup.
+struct Plan<'a> {
+    layout: Layout,
+    shape: TileShape,
+    rows: usize,
+    columns: usize,
+    needs: &'a [Option<(usize, usize)>],
+    keep_from: &'a [usize],
+    height: usize,
+    flat: bool,
+    turned: bool,
+    options: &'a DecodeRgbOptions,
+    alpha: Option<&'a AlphaOver>,
+    scatter: &'a Scatter,
+    column_arrays: &'a Columns,
+    rows_axis: &'a SourceAxis,
+    pixel: &'a PixelRgb,
+}
+
+/// [`convert`]'s bands: tiles placed in rows of samples `S`, rows converted
+/// into `sink` as soon as their chroma is there. `None` when a tile does not
+/// fit the layout (the file needs `decode`'s general path).
+fn convert_bands<S: PlaneRow>(plan: &Plan, first: Tile, tiles: &mut dyn Tiles, pool: &PicturePool, sink: &mut Sink) -> Result<Option<()>> {
+    let Plan { layout, shape, rows, columns, needs, keep_from, height, flat, turned, options, alpha, scatter, column_arrays, rows_axis, pixel } = *plan;
+    let (mut luma, mut cb, mut cr) = (Rows::<S>::new(), Rows::<S>::new(), Rows::<S>::new());
     let mut first = Some(first);
     let mut next_y = 0;
     for band_index in 0..rows {
@@ -1124,7 +1177,7 @@ fn convert(
             // Upright, no interpolation, whole rows kept in order: each source row
             // is converted straight into its output row.
             if let (true, false, None, Some((0, 0, len, false)), Sink::Full { width, data }, false) =
-                (flat, turned, alpha.as_ref(), scatter.span, &mut sink, *NO_IN_PLACE)
+                (flat, turned, alpha, scatter.span, &mut *sink, *NO_IN_PLACE)
                 && len == *width
             {
                 let row = *width * 3;
@@ -1133,27 +1186,27 @@ fn convert(
                 data[touched.start * row..touched.end * row].par_chunks_mut(row).enumerate().for_each(|(i, out)| {
                     let Some(y) = scatter.source_of_row[start + i].filter(|y| (batch..batch_end).contains(y)) else { return };
                     let mut out = crate::color::InPlace { row: out.as_chunks_mut::<3>().0, at: 0 };
-                    flat_row_to(&mut out, y, &luma, &cb, &cr, &column_arrays, &rows_axis, &pixel);
+                    flat_row_to(&mut out, y, &luma, &cb, &cr, column_arrays, rows_axis, pixel);
                 });
                 continue;
             }
             let converted: Vec<Vec<[u8; 3]>> = if flat {
                 // No interpolation anywhere: each pixel's chroma is one sample.
-                (batch..batch_end).into_par_iter().map(|y| flat_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, &pixel)).collect()
+                (batch..batch_end).into_par_iter().map(|y| flat_row(y, &luma, &cb, &cr, column_arrays, rows_axis, pixel)).collect()
             } else if turned || !options.reuse_chroma_rows {
                 // A turned picture's rows share no interpolated chroma.
-                (batch..batch_end).into_par_iter().map(|y| convert_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, turned, &pixel)).collect()
+                (batch..batch_end).into_par_iter().map(|y| convert_row(y, &luma, &cb, &cr, column_arrays, rows_axis, turned, pixel)).collect()
             } else {
                 let tasks: Vec<usize> = (batch..batch_end).step_by(ROWS_PER_TASK).collect();
                 tasks
                     .into_par_iter()
                     .flat_map_iter(|start| {
-                        let mut rows = RowConverter::new(&luma, &cb, &cr, &column_arrays, &rows_axis, &pixel);
+                        let mut rows = RowConverter::new(&luma, &cb, &cr, column_arrays, rows_axis, pixel);
                         (start..(start + ROWS_PER_TASK).min(batch_end)).map(move |y| rows.convert(y))
                     })
                     .collect()
             };
-            sink.put_batch(&scatter, batch, &converted, alpha.as_ref());
+            sink.put_batch(scatter, batch, &converted, alpha);
         }
         next_y = ready;
         luma.drop_below(next_y);
@@ -1164,7 +1217,7 @@ fn convert(
     if next_y != height {
         return Err(HeifError::MalformedHevc("RGB: rows left unconverted"));
     }
-    Ok(Some(sink.finish()))
+    Ok(Some(()))
 }
 
 /// The source columns as flat arrays, for the row loops: the chroma
@@ -1211,10 +1264,10 @@ type Along = Option<(usize, Vec<f32>, Vec<f32>)>;
 /// evaluated once per value. Every index comes from the geometry, not the
 /// data, and lies inside the rows held; a miss would read 0, not panic.
 /// Consecutive rows share the chroma rows they interpolate and the buffers.
-struct RowConverter<'a> {
-    luma: &'a Rows,
-    cb: &'a Rows,
-    cr: &'a Rows,
+struct RowConverter<'a, S> {
+    luma: &'a Rows<S>,
+    cb: &'a Rows<S>,
+    cr: &'a Rows<S>,
     columns: &'a Columns,
     rows: &'a SourceAxis,
     pixel: &'a PixelRgb,
@@ -1226,8 +1279,8 @@ struct RowConverter<'a> {
     luma_row: Vec<i32>,
 }
 
-impl<'a> RowConverter<'a> {
-    fn new(luma: &'a Rows, cb: &'a Rows, cr: &'a Rows, columns: &'a Columns, rows: &'a SourceAxis, pixel: &'a PixelRgb) -> Self {
+impl<'a, S: BandSample> RowConverter<'a, S> {
+    fn new(luma: &'a Rows<S>, cb: &'a Rows<S>, cr: &'a Rows<S>, columns: &'a Columns, rows: &'a SourceAxis, pixel: &'a PixelRgb) -> Self {
         RowConverter { luma, cb, cr, columns, rows, pixel, along: [None, None], cb_row: Vec::new(), cr_row: Vec::new(), luma_row: Vec::new() }
     }
 
@@ -1239,7 +1292,7 @@ impl<'a> RowConverter<'a> {
         let pixel = self.pixel;
         if pixel.monochrome() {
             for (o, &s) in out.iter_mut().zip(samples) {
-                *o = pixel.rgb8(i32::from(s), 0.0, 0.0);
+                *o = pixel.rgb8(s.value(), 0.0, 0.0);
             }
             return out;
         }
@@ -1259,7 +1312,7 @@ impl<'a> RowConverter<'a> {
             blend(cr_top, cr_bottom, cr_row);
         }
         self.luma_row.clear();
-        self.luma_row.extend(samples.iter().map(|&s| i32::from(s)));
+        self.luma_row.extend(samples.iter().map(|&s| s.value()));
         pixel.row8(&mut out, &self.luma_row, cb_row, cr_row);
         out
     }
@@ -1270,17 +1323,17 @@ impl<'a> RowConverter<'a> {
 /// evaluated once per value. Every index comes from the geometry, not the
 /// data, and lies inside the rows held; a miss would read 0, not panic.
 #[allow(clippy::too_many_arguments)]
-fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, turned: bool, pixel: &PixelRgb) -> Vec<[u8; 3]> {
+fn convert_row<S: BandSample>(y: usize, luma: &Rows<S>, cb: &Rows<S>, cr: &Rows<S>, columns: &Columns, rows: &SourceAxis, turned: bool, pixel: &PixelRgb) -> Vec<[u8; 3]> {
     let samples = luma.get(y);
     let Some(ry) = rows.entries[y] else { return Vec::new() };
     let mut out = vec![[0u8; 3]; samples.len()];
     if pixel.monochrome() {
         for (o, &s) in out.iter_mut().zip(samples) {
-            *o = pixel.rgb8(i32::from(s), 0.0, 0.0);
+            *o = pixel.rgb8(s.value(), 0.0, 0.0);
         }
         return out;
     }
-    let at = |row: &[u16], i: usize| i32::from(row.get(i).copied().unwrap_or(0));
+    let at = |row: &[S], i: usize| row.get(i).map_or(0, |s| s.value());
     let (cb_lo, cb_hi, cr_lo, cr_hi) = (cb.get(ry.lo), cb.get(ry.hi), cr.get(ry.lo), cr.get(ry.hi));
     // Chroma blended for every pixel of the row, then the row through the
     // planar converter's own matrix loop.
@@ -1290,7 +1343,7 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
         // interpolation is between this row's two chroma rows, the same
         // for every source chroma column. Then the vertical one, per pixel.
         let across =
-            |lo: &[u16], hi: &[u16]| -> Vec<f32> { (0..lo.len().max(hi.len())).map(|c| PixelRgb::lerp_samples(at(lo, c), at(hi, c), ry.weight)).collect() };
+            |lo: &[S], hi: &[S]| -> Vec<f32> { (0..lo.len().max(hi.len())).map(|c| PixelRgb::lerp_samples(at(lo, c), at(hi, c), ry.weight)).collect() };
         let (h_cb, h_cr) = (across(cb_lo, cb_hi), across(cr_lo, cr_hi));
         let pick = |h: &[f32], i: usize| h.get(i).copied().unwrap_or(0.0);
         let blend = |h: &[f32]| -> Vec<f32> {
@@ -1307,13 +1360,13 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
         (blend(&h_cb), blend(&h_cr))
     } else {
         // Each chroma row interpolated to this row's width, then blended.
-        let along = |row: &[u16]| -> Vec<f32> {
+        let along = |row: &[S]| -> Vec<f32> {
             columns.lo.iter().zip(&columns.hi).zip(&columns.weight).map(|((&lo, &hi), &w)| PixelRgb::lerp_samples(at(row, lo), at(row, hi), w)).collect()
         };
         let blend = |top: Vec<f32>, bottom: Vec<f32>| -> Vec<f32> { top.iter().zip(&bottom).map(|(&t, &b)| PixelRgb::lerp_rows(t, b, ry.weight)).collect() };
         (blend(along(cb_lo), along(cb_hi)), blend(along(cr_lo), along(cr_hi)))
     };
-    let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
+    let luma_row: Vec<i32> = samples.iter().map(|&s| s.value()).collect();
     pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
     out
 }
@@ -1323,7 +1376,7 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
 /// sample it keeps, exactly, as `x * 1.0 + y * 0.0 == x` for the
 /// non-negative integers samples are. Upright or turned, that sample is
 /// chroma row `ry.lo` at column `columns.lo[x]`.
-fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) -> Vec<[u8; 3]> {
+fn flat_row<S: BandSample>(y: usize, luma: &Rows<S>, cb: &Rows<S>, cr: &Rows<S>, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) -> Vec<[u8; 3]> {
     let mut out = Vec::new();
     if rows.entries[y].is_some() {
         out.reserve_exact(luma.get(y).len());
@@ -1334,12 +1387,12 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
 
 /// [`flat_row`] written to `out`.
 #[allow(clippy::too_many_arguments)]
-fn flat_row_to<O: crate::color::RowOut>(out: &mut O, y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) {
+fn flat_row_to<O: crate::color::RowOut, S: BandSample>(out: &mut O, y: usize, luma: &Rows<S>, cb: &Rows<S>, cr: &Rows<S>, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) {
     let samples = luma.get(y);
     let Some(ry) = rows.entries[y] else { return };
     if pixel.monochrome() {
         for &s in samples {
-            out.push(pixel.rgb8(i32::from(s), 0.0, 0.0));
+            out.push(pixel.rgb8(s.value(), 0.0, 0.0));
         }
         return;
     }
@@ -1355,32 +1408,32 @@ fn flat_row_to<O: crate::color::RowOut>(out: &mut O, y: usize, luma: &Rows, cb: 
         let head = phase.min(samples.len());
         for (x, &s) in samples.iter().enumerate().take(head) {
             let (c_b, c_r) = chroma(x);
-            out.push(pixel.rgb8(i32::from(s), c_b, c_r));
+            out.push(pixel.rgb8(s.value(), c_b, c_r));
         }
         let c0 = lo0 + phase;
         let (cb_k, cr_k) = (cb_row.get(c0..=last).unwrap_or(&[]), cr_row.get(c0..=last).unwrap_or(&[]));
         let done = head + pixel.row8_420_nearest(out, &samples[head..], cb_k, cr_k);
         for (x, &s) in samples.iter().enumerate().skip(done) {
             let (c_b, c_r) = chroma(x);
-            out.push(pixel.rgb8(i32::from(s), c_b, c_r));
+            out.push(pixel.rgb8(s.value(), c_b, c_r));
         }
         return;
     }
-    let pick = |row: &[u16]| -> Vec<f32> { columns.lo.iter().map(|&lo| at(row, lo) as f32).collect() };
+    let pick = |row: &[S]| -> Vec<f32> { columns.lo.iter().map(|&lo| at(row, lo) as f32).collect() };
     let (cb_row, cr_row) = (pick(cb.get(ry.lo)), pick(cr.get(ry.lo)));
-    let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
+    let luma_row: Vec<i32> = samples.iter().map(|&s| s.value()).collect();
     pixel.row8(out.next(samples.len()), &luma_row, &cb_row, &cr_row);
 }
 
 /// A chroma sample as `i32`, 0 past the row's end.
-fn at(row: &[u16], i: usize) -> i32 {
-    i32::from(row.get(i).copied().unwrap_or(0))
+fn at<S: BandSample>(row: &[S], i: usize) -> i32 {
+    row.get(i).map_or(0, |s| s.value())
 }
 
 /// The slot of `slots` holding chroma row `index` interpolated along the
 /// columns. A missing row replaces one other than `keep`, the row the same
 /// output row also reads, and otherwise the lower one.
-fn along(slots: &mut [Along; 2], index: usize, keep: usize, cb: &Rows, cr: &Rows, columns: &Columns) -> usize {
+fn along<S: BandSample>(slots: &mut [Along; 2], index: usize, keep: usize, cb: &Rows<S>, cr: &Rows<S>, columns: &Columns) -> usize {
     if let Some(slot) = slots.iter().position(|s| s.as_ref().is_some_and(|s| s.0 == index)) {
         return slot;
     }
@@ -1393,7 +1446,7 @@ fn along(slots: &mut [Along; 2], index: usize, keep: usize, cb: &Rows, cr: &Rows
         (Some(a), Some(b)) => usize::from(b < a),
     };
     let (_, cb_along, cr_along) = slots[slot].get_or_insert_with(|| (index, Vec::new(), Vec::new()));
-    let interpolate = |row: &[u16], to: &mut Vec<f32>| {
+    let interpolate = |row: &[S], to: &mut Vec<f32>| {
         to.clear();
         to.extend(columns.lo.iter().zip(&columns.hi).zip(&columns.weight).map(|((&lo, &hi), &w)| PixelRgb::lerp_samples(at(row, lo), at(row, hi), w)));
     };
@@ -1457,3 +1510,5 @@ static NO_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::en
 static ZERO_FILL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_ZERO_FILL").as_deref() == Ok("1"));
 /// `HEIC_NO_IN_PLACE=1`: upright rows converted to their own buffers, then copied (A/B runs).
 static NO_IN_PLACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_IN_PLACE").as_deref() == Ok("1"));
+/// `HEIC_WIDE_BANDS=1`: 8-bit pictures held in `u16` band rows, as before (A/B runs).
+static WIDE_BANDS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_WIDE_BANDS").as_deref() == Ok("1"));
