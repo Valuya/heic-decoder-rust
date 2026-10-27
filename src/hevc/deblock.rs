@@ -311,6 +311,78 @@ pub fn deblock_picture(pic: &mut Picture, sps: &Sps, beta_offset_div2: i32, tc_o
     let (width, height) = (pic.width(), pic.height());
     let (beta_offset, tc_offset) = (beta_offset_div2 * 2, tc_offset_div2 * 2);
 
+    if !luma_intra(pic, width, height, beta_offset, tc_offset)? {
+        luma_any(pic, width, height, beta_offset, tc_offset)?;
+    }
+    chroma_edges(pic, sps, width, height, tc_offset, cb_qp_offset, cr_qp_offset)
+}
+
+/// Luma edges of an intra picture straight from the per-min-PU maps: every
+/// CU or TU edge has `bS == 2` (clause 8.7.2.4), the bypass lookups only run
+/// when the picture has bypass-coded CUs, and `beta`/`tc` are recomputed only
+/// when `QpL` changes. The same decisions and filters as [`filter_luma_segment`],
+/// edge for edge; edges in one direction do not overlap, so their order is free.
+fn luma_intra(pic: &mut Picture, width: usize, height: usize, beta_offset: i32, tc_offset: i32) -> Result<bool> {
+    let any_bypass = pic.has_bypass();
+    let Some((plane, flags, qp, w4, slice_start_y)) = pic.luma_deblock_parts() else { return Ok(false) };
+    let bit_depth = plane.bit_depth as i32;
+    let max_val = (1i32 << bit_depth) - 1;
+    let (w, h) = (plane.width, plane.height);
+    let mut cached = (i32::MIN, 0, 0);
+    let mut params = |qp_l: i32| -> Result<(i32, i32)> {
+        if cached.0 != qp_l {
+            let q_beta = clip3(0, 51, qp_l + beta_offset) as usize;
+            let beta = BETA_PRIME.get(q_beta).ok_or(HeifError::MalformedHevc("deblock: beta table index"))? << (bit_depth - 8);
+            let q_tc = clip3(0, 53, qp_l + 2 + tc_offset) as usize;
+            let tc = TC_PRIME.get(q_tc).ok_or(HeifError::MalformedHevc("deblock: tc table index"))? << (bit_depth - 8);
+            cached = (qp_l, beta, tc);
+        }
+        Ok((cached.1, cached.2))
+    };
+    let qp_at = |i: usize, y: usize| if y < slice_start_y { 0 } else { qp.get(i).map_or(0, |&q| i32::from(q)) };
+    let bypass = |i: usize| any_bypass && flags.get(i).is_some_and(|&f| f & super::ctu::BYPASS != 0);
+    let samples = plane.samples_mut();
+    let mut filter = |at: SegmentAt, beta: i32, tc: i32, pp: bool, pq: bool| match &mut *samples {
+        Samples::Narrow(s) => filter_luma_lines(s, at, beta, tc, max_val, pp, pq),
+        Samples::Wide(s) => filter_luma_lines(s, at, beta, tc, max_val, pp, pq),
+    };
+    let (left, top) = (super::ctu::CU_EDGE_LEFT | super::ctu::TU_EDGE_LEFT, super::ctu::CU_EDGE_TOP | super::ctu::TU_EDGE_TOP);
+    // vertical edges
+    for y in (0..height).step_by(4) {
+        let row = (y / 4) * w4;
+        for x in (8..width).step_by(8) {
+            let iq = row + x / 4;
+            if flags.get(iq).is_none_or(|&f| f & left == 0) {
+                continue;
+            }
+            let ip = iq - 1;
+            let (beta, tc) = params((qp_at(ip, y) + qp_at(iq, y) + 1) >> 1)?;
+            if tc == 0 || x < 4 || x + 4 > w || y + 4 > h {
+                continue;
+            }
+            filter(SegmentAt { w, x, y, vertical: true }, beta, tc, bypass(ip), bypass(iq));
+        }
+    }
+    // horizontal edges
+    for y in (8..height).step_by(8) {
+        let (row, row_p) = ((y / 4) * w4, ((y - 1) / 4) * w4);
+        for x in (0..width).step_by(4) {
+            let iq = row + x / 4;
+            if flags.get(iq).is_none_or(|&f| f & top == 0) {
+                continue;
+            }
+            let ip = row_p + x / 4;
+            let (beta, tc) = params((qp_at(ip, y - 1) + qp_at(iq, y) + 1) >> 1)?;
+            if tc == 0 || y < 4 || y + 4 > h || x + 4 > w {
+                continue;
+            }
+            filter(SegmentAt { w, x, y, vertical: false }, beta, tc, bypass(ip), bypass(iq));
+        }
+    }
+    Ok(true)
+}
+
+fn luma_any(pic: &mut Picture, width: usize, height: usize, beta_offset: i32, tc_offset: i32) -> Result<()> {
     let mut x = 8usize;
     while x < width {
         let mut y = 0usize;
@@ -329,7 +401,11 @@ pub fn deblock_picture(pic: &mut Picture, sps: &Sps, beta_offset_div2: i32, tc_o
         }
         y += 8;
     }
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+fn chroma_edges(pic: &mut Picture, sps: &Sps, width: usize, height: usize, tc_offset: i32, cb_qp_offset: i32, cr_qp_offset: i32) -> Result<()> {
     if sps.chroma_format_idc == 0 {
         return Ok(());
     }
