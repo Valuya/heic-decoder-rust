@@ -1081,6 +1081,11 @@ fn convert_rgba<T: RgbSample>(image: &DecodedImage, options: &RgbOptions) -> Res
     Ok(RgbaImage { width: rgb.width, height: rgb.height, data: rgb.data, premultiplied: image.alpha.as_ref().is_some_and(|alpha| alpha.premultiplied) })
 }
 
+/// PoC switch: `HEIC_FAST_RGB=1` converts nearest 4:2:0 rows with libheif's
+/// 8-bit fixed-point precision (not bit-identical to the exact f32 formula).
+#[cfg(target_arch = "x86_64")]
+static FAST_RGB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_FAST_RGB").as_deref() == Ok("1"));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1346,8 +1351,3 @@ mod tests {
         assert!(image(-1).to_rgb8_with_options(&nearest).is_err());
     }
 }
-
-/// PoC switch: `HEIC_FAST_RGB=1` converts nearest 4:2:0 rows with libheif's
-/// 8-bit fixed-point precision (not bit-identical to the exact f32 formula).
-#[cfg(target_arch = "x86_64")]
-static FAST_RGB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_FAST_RGB").as_deref() == Ok("1"));

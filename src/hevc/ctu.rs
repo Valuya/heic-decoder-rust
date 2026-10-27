@@ -371,6 +371,11 @@ fn min_pu_index(min_pu_width: usize, min_pu_height: usize, x: i64, y: i64) -> Op
     Some((y as usize / 4) * min_pu_width + (x as usize / 4))
 }
 
+/// [`Picture::luma_deblock_parts`]: the luma plane, flags, `QpY`, min-PU row width, slice's first row.
+pub(crate) type LumaDeblockParts<'a> = (&'a mut Plane, &'a [u8], &'a [i8], usize, usize);
+/// [`Picture::chroma_deblock_parts`]: both chroma planes, then as [`LumaDeblockParts`].
+pub(crate) type ChromaDeblockParts<'a> = (&'a mut Plane, &'a mut Plane, &'a [u8], &'a [i8], usize, usize);
+
 /// Which min-PUs are coded with transquant bypass, read while a plane is
 /// borrowed mutably.
 pub(crate) struct BypassMap<'a> {
@@ -543,7 +548,7 @@ impl Picture {
     /// For deblocking an intra picture's luma: the luma plane, and beside it
     /// (borrowed apart) the per-min-PU flags and `QpY`, the min-PU row width
     /// and the slice's first row. `None` once any PU is inter-coded.
-    pub(crate) fn luma_deblock_parts(&mut self) -> Option<(&mut Plane, &[u8], &[i8], usize, usize)> {
+    pub(crate) fn luma_deblock_parts(&mut self) -> Option<LumaDeblockParts<'_>> {
         if !self.motions.is_empty() {
             return None;
         }
@@ -553,7 +558,7 @@ impl Picture {
     /// For deblocking an intra picture's chroma: both chroma planes, and beside
     /// them the per-min-PU flags and `QpY`, the min-PU row width and the
     /// slice's first row. `None` once any PU is inter-coded.
-    pub(crate) fn chroma_deblock_parts(&mut self) -> Option<(&mut Plane, &mut Plane, &[u8], &[i8], usize, usize)> {
+    pub(crate) fn chroma_deblock_parts(&mut self) -> Option<ChromaDeblockParts<'_>> {
         if !self.motions.is_empty() {
             return None;
         }
@@ -1863,6 +1868,61 @@ pub(crate) fn decode_slice_rows(
     Ok(())
 }
 
+/// `HEIC_OLD_BORDER=1`: build intra borders sample by sample (for A/B runs).
+static OLD_BORDER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_OLD_BORDER").as_deref() == Ok("1"));
+
+/// `HEIC_NO_SIMD_WRITE=1`: reconstruct with the scalar loops (for A/B runs).
+#[cfg(target_arch = "x86_64")]
+static SIMD_WRITE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_SIMD_WRITE").as_deref() != Ok("1"));
+
+#[cfg(target_arch = "x86_64")]
+struct SumWrite<'a> {
+    simd: pulp::x86::V3,
+    samples: &'a mut [u8],
+    width: usize,
+    x0: usize,
+    y0: usize,
+    n: usize,
+    pred: &'a [i32],
+    res: &'a [i32],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for SumWrite<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn call(self) {
+        use core::arch::x86_64::{__m128i, __m256i};
+        use pulp::bytemuck::cast;
+        let SumWrite { simd, samples, width, x0, y0, n, pred, res } = self;
+        let (sse2, sse41, avx, avx2) = (simd.sse2, simd.sse4_1, simd.avx, simd.avx2);
+        for row in 0..n {
+            let start = (y0 + row) * width + x0;
+            let (p, r) = (&pred[row * n..row * n + n], &res[row * n..row * n + n]);
+            let dst = &mut samples[start..start + n];
+            if n == 4 {
+                let (p4, r4): ([i32; 4], [i32; 4]) = (p.try_into().unwrap_or([0; 4]), r.try_into().unwrap_or([0; 4]));
+                let sum = sse2._mm_add_epi32(cast::<[i32; 4], __m128i>(p4), cast::<[i32; 4], __m128i>(r4));
+                let w16 = sse41._mm_packus_epi32(sum, sum);
+                let b = sse2._mm_packus_epi16(w16, w16);
+                let bytes: [u8; 16] = cast(b);
+                dst.copy_from_slice(&bytes[..4]);
+            } else {
+                let (p8, r8, d8) = (p.as_chunks::<8>().0, r.as_chunks::<8>().0, dst.as_chunks_mut::<8>().0);
+                for ((d, p), r) in d8.iter_mut().zip(p8).zip(r8) {
+                    let sum = avx2._mm256_add_epi32(cast::<[i32; 8], __m256i>(*p), cast::<[i32; 8], __m256i>(*r));
+                    let (lo, hi) = (avx._mm256_castsi256_si128(sum), avx2._mm256_extracti128_si256::<1>(sum));
+                    let w16 = sse41._mm_packus_epi32(lo, hi);
+                    let b = sse2._mm_packus_epi16(w16, w16);
+                    let bytes: [u8; 16] = cast(b);
+                    d.copy_from_slice(&bytes[..8]);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,60 +1991,5 @@ mod tests {
         cand.sort_unstable();
         // rem=0 should land on the first mode not in {0,1,26}, i.e. 2.
         assert_eq!(rem_mode_from_candidates(0, cand), 2);
-    }
-}
-
-/// `HEIC_OLD_BORDER=1`: build intra borders sample by sample (for A/B runs).
-static OLD_BORDER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_OLD_BORDER").as_deref() == Ok("1"));
-
-/// `HEIC_NO_SIMD_WRITE=1`: reconstruct with the scalar loops (for A/B runs).
-#[cfg(target_arch = "x86_64")]
-static SIMD_WRITE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_SIMD_WRITE").as_deref() != Ok("1"));
-
-#[cfg(target_arch = "x86_64")]
-struct SumWrite<'a> {
-    simd: pulp::x86::V3,
-    samples: &'a mut [u8],
-    width: usize,
-    x0: usize,
-    y0: usize,
-    n: usize,
-    pred: &'a [i32],
-    res: &'a [i32],
-}
-
-#[cfg(target_arch = "x86_64")]
-impl pulp::NullaryFnOnce for SumWrite<'_> {
-    type Output = ();
-
-    #[inline(always)]
-    fn call(self) {
-        use core::arch::x86_64::{__m128i, __m256i};
-        use pulp::bytemuck::cast;
-        let SumWrite { simd, samples, width, x0, y0, n, pred, res } = self;
-        let (sse2, sse41, avx, avx2) = (simd.sse2, simd.sse4_1, simd.avx, simd.avx2);
-        for row in 0..n {
-            let start = (y0 + row) * width + x0;
-            let (p, r) = (&pred[row * n..row * n + n], &res[row * n..row * n + n]);
-            let dst = &mut samples[start..start + n];
-            if n == 4 {
-                let (p4, r4): ([i32; 4], [i32; 4]) = (p.try_into().unwrap_or([0; 4]), r.try_into().unwrap_or([0; 4]));
-                let sum = sse2._mm_add_epi32(cast::<[i32; 4], __m128i>(p4), cast::<[i32; 4], __m128i>(r4));
-                let w16 = sse41._mm_packus_epi32(sum, sum);
-                let b = sse2._mm_packus_epi16(w16, w16);
-                let bytes: [u8; 16] = cast(b);
-                dst.copy_from_slice(&bytes[..4]);
-            } else {
-                let (p8, r8, d8) = (p.as_chunks::<8>().0, r.as_chunks::<8>().0, dst.as_chunks_mut::<8>().0);
-                for ((d, p), r) in d8.iter_mut().zip(p8).zip(r8) {
-                    let sum = avx2._mm256_add_epi32(cast::<[i32; 8], __m256i>(*p), cast::<[i32; 8], __m256i>(*r));
-                    let (lo, hi) = (avx._mm256_castsi256_si128(sum), avx2._mm256_extracti128_si256::<1>(sum));
-                    let w16 = sse41._mm_packus_epi32(lo, hi);
-                    let b = sse2._mm_packus_epi16(w16, w16);
-                    let bytes: [u8; 16] = cast(b);
-                    d.copy_from_slice(&bytes[..8]);
-                }
-            }
-        }
     }
 }

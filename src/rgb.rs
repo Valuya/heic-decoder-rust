@@ -1458,6 +1458,17 @@ fn along<S: BandSample>(slots: &mut [Along; 2], index: usize, keep: usize, cb: &
     slot
 }
 
+/// `HEIC_NO_TURN_BLOCKS=1`: gather turned rows pixel by pixel (A/B runs).
+static NO_TURN_BLOCKS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_TURN_BLOCKS").as_deref() == Ok("1"));
+/// `HEIC_NO_FUSED=1`: nearest 4:2:0 rows through the general row loop (A/B runs).
+static NO_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_FUSED").as_deref() == Ok("1"));
+/// `HEIC_ZERO_FILL=1`: the output written with zeros first, as before (A/B runs).
+static ZERO_FILL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_ZERO_FILL").as_deref() == Ok("1"));
+/// `HEIC_NO_IN_PLACE=1`: upright rows converted to their own buffers, then copied (A/B runs).
+static NO_IN_PLACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_IN_PLACE").as_deref() == Ok("1"));
+/// `HEIC_WIDE_BANDS=1`: 8-bit pictures held in `u16` band rows, as before (A/B runs).
+static WIDE_BANDS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_WIDE_BANDS").as_deref() == Ok("1"));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,14 +1512,3 @@ mod tests {
         assert_eq!(bins.finish().data, [0, 10, 255, 200, 10, 255]);
     }
 }
-
-/// `HEIC_NO_TURN_BLOCKS=1`: gather turned rows pixel by pixel (A/B runs).
-static NO_TURN_BLOCKS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_TURN_BLOCKS").as_deref() == Ok("1"));
-/// `HEIC_NO_FUSED=1`: nearest 4:2:0 rows through the general row loop (A/B runs).
-static NO_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_FUSED").as_deref() == Ok("1"));
-/// `HEIC_ZERO_FILL=1`: the output written with zeros first, as before (A/B runs).
-static ZERO_FILL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_ZERO_FILL").as_deref() == Ok("1"));
-/// `HEIC_NO_IN_PLACE=1`: upright rows converted to their own buffers, then copied (A/B runs).
-static NO_IN_PLACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_IN_PLACE").as_deref() == Ok("1"));
-/// `HEIC_WIDE_BANDS=1`: 8-bit pictures held in `u16` band rows, as before (A/B runs).
-static WIDE_BANDS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_WIDE_BANDS").as_deref() == Ok("1"));
