@@ -71,13 +71,24 @@ const TRANSITION: [[u8; 128]; 2] = {
     table
 };
 
+/// A context: probability state and most probable symbol, packed as
+/// `state * 2 + mps` (one byte, the index [`TRANSITION`] takes and returns).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextModel {
-    pub state: u8,
-    pub mps: u8,
+    packed: u8,
 }
 
 impl ContextModel {
+    pub const fn new(state: u8, mps: u8) -> Self {
+        ContextModel { packed: (state << 1) | (mps & 1) }
+    }
+    pub fn state(self) -> u8 {
+        self.packed >> 1
+    }
+    pub fn mps(self) -> u8 {
+        self.packed & 1
+    }
+
     /// `set_initValue`, clause 9.3.2.2. `qp` is the slice's `SliceQpY`.
     pub fn init(init_value: u8, qp: i32) -> Self {
         let slope_idx = (init_value >> 4) as i32;
@@ -89,7 +100,7 @@ impl ContextModel {
         let pre_ctx_state = pre_ctx_state.clamp(1, 126);
         let mps = if pre_ctx_state <= 63 { 0 } else { 1 };
         let state = if mps == 1 { pre_ctx_state - 64 } else { 63 - pre_ctx_state };
-        ContextModel { state: state as u8, mps }
+        ContextModel::new(state as u8, mps)
     }
 }
 
@@ -161,6 +172,17 @@ impl<'a, 'b> Engine<'a, 'b> {
 
     #[inline(never)]
     fn refill(&mut self) {
+        // Eight bytes at once where they exist: the whole bytes that fit are
+        // claimed; bits past them are the stream's next bits, so OR-ing them
+        // again on the next refill changes nothing.
+        if let Some(bytes) = self.data.get(self.pos..self.pos + 8) {
+            let word = u64::from_be_bytes(bytes.try_into().unwrap_or([0; 8]));
+            let take = (64 - self.cache_bits) & !7;
+            self.cache |= word >> self.cache_bits;
+            self.cache_bits += take;
+            self.pos += (take / 8) as usize;
+            return;
+        }
         while self.cache_bits <= 56 {
             let Some(&byte) = self.data.get(self.pos) else { break };
             self.cache |= u64::from(byte) << (56 - self.cache_bits);
@@ -193,17 +215,16 @@ impl<'a, 'b> Engine<'a, 'b> {
         // `state` is below 64 (every table entry is) and `range` is in
         // 256..=510, so the masks never change an index; they only let the
         // compiler drop the bounds checks.
-        let state = ctx.state as usize & 63;
-        let mps = u32::from(ctx.mps & 1);
+        let packed = ctx.packed as usize & 127;
+        let state = packed >> 1;
+        let mps = (packed & 1) as u32;
         let lps_range = LPS_RANGE[state][(self.range >> 6) as usize & 3];
         let mps_range = self.range - lps_range;
         let is_lps = u32::from(self.offset >= mps_range);
         let mask = is_lps.wrapping_neg();
         self.offset -= mps_range & mask;
         self.range = mps_range ^ ((mps_range ^ lps_range) & mask);
-        let next = TRANSITION[is_lps as usize][state * 2 + mps as usize];
-        ctx.state = next >> 1;
-        ctx.mps = next & 1;
+        ctx.packed = TRANSITION[is_lps as usize][packed];
         // `range` is now in 2..=510: shift it back to 9 bits, 0 to 7 places.
         let n = self.range.leading_zeros() - 23;
         self.range <<= n;
@@ -234,21 +255,22 @@ impl<'a, 'b> Engine<'a, 'b> {
     /// reference it is tested against.
     #[cfg(test)]
     fn reference_decision(&mut self, ctx: &mut ContextModel) -> u32 {
-        let state = ctx.state as usize & 63;
+        let state = ctx.state() as usize & 63;
+        let mut mps = ctx.mps();
         let lps_range = LPS_RANGE[state][(self.range >> 6) as usize & 3];
         self.range -= lps_range;
         let bin_val;
         if self.offset >= self.range {
-            bin_val = 1 - ctx.mps as u32;
+            bin_val = 1 - mps as u32;
             self.offset -= self.range;
             self.range = lps_range;
             if state == 0 {
-                ctx.mps = 1 - ctx.mps;
+                mps = 1 - mps;
             }
-            ctx.state = NEXT_STATE_LPS[state];
+            *ctx = ContextModel::new(NEXT_STATE_LPS[state], mps);
         } else {
-            bin_val = ctx.mps as u32;
-            ctx.state = NEXT_STATE_MPS[state];
+            bin_val = mps as u32;
+            *ctx = ContextModel::new(NEXT_STATE_MPS[state], mps);
         }
         self.renormalize();
         bin_val
@@ -295,6 +317,31 @@ impl<'a, 'b> Engine<'a, 'b> {
             left -= k;
         }
         Ok(v)
+    }
+
+    /// A short `coeff_abs_level_remaining` from one division: a unary prefix
+    /// of at most 3 ones, its terminating 0 and `rice` suffix bins, when all of
+    /// them lie in the next 8 bypass bins (the quotient [`Engine::bypass_unary`]
+    /// computes holds the suffix too). `Some((prefix, suffix))` with the bins
+    /// consumed, or `None` with nothing consumed (then decode it bin run by run).
+    #[inline(always)]
+    pub fn bypass_rice_short(&mut self, rice: u32) -> Option<(u32, u32)> {
+        if self.cache_bits < 8 || self.offset >= self.range || rice > 4 {
+            return None;
+        }
+        let bits = (self.cache >> 56) as u32;
+        let quotient = ((self.offset << 8) | bits) / self.range;
+        let leading = (!(quotient << 24)).leading_zeros();
+        let take = leading + 1 + rice;
+        if leading > 3 || take > 8 {
+            return None;
+        }
+        let q = quotient >> (8 - take);
+        let dividend = (self.offset << take) | (bits >> (8 - take));
+        self.offset = dividend - q * self.range;
+        self.cache <<= take;
+        self.cache_bits -= take;
+        Some((leading, q & ((1 << rice) - 1)))
     }
 
     /// A unary run of bypass bins: the 1-bins up to and including the 0
@@ -407,7 +454,7 @@ mod tests {
             .collect();
         let (mut r1, mut r2) = (BitReader::new(&data), BitReader::new(&data));
         let (mut fast, mut reference) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
-        let mut contexts: Vec<ContextModel> = (0..128).map(|i| ContextModel { state: i / 2, mps: i % 2 }).collect();
+        let mut contexts: Vec<ContextModel> = (0..128).map(|i| ContextModel::new(i / 2, i % 2)).collect();
         let mut expected = contexts.clone();
         for i in 0..40_000usize {
             let k = (i * 7919 + i / 3) % 128;
@@ -433,7 +480,7 @@ mod tests {
             .collect();
         let (mut r1, mut r2) = (BitReader::new(&data), BitReader::new(&data));
         let (mut fast, mut slow) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
-        let mut ctx_a = ContextModel { state: 10, mps: 0 };
+        let mut ctx_a = ContextModel::new(10, 0);
         let mut ctx_b = ctx_a;
         for i in 0..2000u32 {
             let n = i % 32;
@@ -464,7 +511,7 @@ mod tests {
             let data = &data[..cut];
             let (mut r1, mut r2) = (BitReader::new(data), BitReader::new(data));
             let (mut fast, mut slow) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
-            let mut ctx_a = ContextModel { state: 20, mps: 1 };
+            let mut ctx_a = ContextModel::new(20, 1);
             let mut ctx_b = ctx_a;
             for i in 0..3000u32 {
                 let max = [1, 3, 8, 9, 19, 33][i as usize % 6];
@@ -480,13 +527,58 @@ mod tests {
     }
 
     #[test]
+    fn short_rice_codes_match_bin_by_bin() {
+        let mut seed = 0x8CB9_2BA7_2F3D_8DD7u64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        for cut in [data.len(), 37, 11, 3] {
+            let data = &data[..cut];
+            let (mut r1, mut r2) = (BitReader::new(data), BitReader::new(data));
+            let (mut fast, mut slow) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
+            let (mut ctx_a, mut taken) = (ContextModel::new(20, 1), 0);
+            let mut ctx_b = ctx_a;
+            for i in 0..3000u32 {
+                let rice = i % 5;
+                let before = (fast.range, fast.offset, fast.cache_bits);
+                let (prefix, suffix) = match fast.bypass_rice_short(rice) {
+                    Some(code) => {
+                        taken += 1;
+                        code
+                    }
+                    None => {
+                        // Nothing consumed; then the runs the caller falls back to.
+                        assert_eq!(before, (fast.range, fast.offset, fast.cache_bits), "cut {cut} code {i}");
+                        let prefix = fast.bypass_unary(4).unwrap();
+                        (prefix, if prefix <= 3 { fast.bypass_fl(rice).unwrap() } else { 0 })
+                    }
+                };
+                let mut want_prefix = 0;
+                while want_prefix < 4 && slow.bypass().unwrap() == 1 {
+                    want_prefix += 1;
+                }
+                let want_suffix = if want_prefix <= 3 { (0..rice).fold(0, |v, _| (v << 1) | slow.bypass().unwrap()) } else { 0 };
+                assert_eq!((prefix, suffix), (want_prefix, want_suffix), "cut {cut} code {i}");
+                assert_eq!((fast.range, fast.offset, fast.overread), (slow.range, slow.offset, slow.overread), "cut {cut} code {i}");
+                assert_eq!(fast.decision(&mut ctx_a).unwrap(), slow.reference_decision(&mut ctx_b));
+            }
+            assert!(cut < 64 || taken > 1000, "cut {cut}: only {taken} short codes");
+        }
+    }
+
+    #[test]
     fn context_init_matches_known_example() {
         // slopeIdx=184>>4=11, intersec=184&0xF=8: m=11*5-45=10, n=(8<<3)-16=48.
         // QP=32: preCtxState=((10*32)>>4)+48=(320>>4)+48=20+48=68. mps=1 (68>63).
         // state=68-64=4.
         let cm = ContextModel::init(184, 32);
-        assert_eq!(cm.mps, 1);
-        assert_eq!(cm.state, 4);
+        assert_eq!(cm.mps(), 1);
+        assert_eq!(cm.state(), 4);
     }
 
     #[test]
