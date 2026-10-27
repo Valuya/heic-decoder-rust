@@ -328,8 +328,157 @@ impl PixelRgb {
     /// A whole row through `Matrix::row` itself, the loop the planar
     /// converter vectorizes; not for monochrome (see [`PixelRgb::rgb8`]).
     pub(crate) fn row8(&self, pixels: &mut [[u8; 3]], luma: &[i32], cb: &[f32], cr: &[f32]) {
-        self.matrix.row::<u8, 3>(pixels, luma, cb, cr);
+        let mut done = 0;
+        #[cfg(target_arch = "x86_64")]
+        if !self.matrix.identity && *AVX2 {
+            if let Some(simd) = pulp::x86::V3::try_new() {
+                let n = pixels.len().min(luma.len()).min(cb.len()).min(cr.len());
+                done = simd.vectorize(Row8Avx2 { simd, m: &self.matrix, pixels: &mut pixels[..n], luma: &luma[..n], cb: &cb[..n], cr: &cr[..n] });
+            }
+        }
+        if done < pixels.len() {
+            let n = pixels.len().min(luma.len()).min(cb.len()).min(cr.len()).max(done);
+            self.matrix.row::<u8, 3>(&mut pixels[done..n], &luma[done..n], &cb[done..n], &cr[done..n]);
+        }
     }
+}
+
+/// Whether the AVX2 row kernel runs; `HEIC_NO_SIMD=1` turns it off (for A/B runs).
+#[cfg(target_arch = "x86_64")]
+static AVX2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_SIMD").as_deref() != Ok("1"));
+
+/// Byte shuffles interleaving 16 R, G and B samples into 48 RGB bytes:
+/// entry `3 * k + c` places channel `c` into output block `k`.
+#[cfg(target_arch = "x86_64")]
+const INTERLEAVE: [[i8; 16]; 9] = [
+    [0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5],
+    [-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1],
+    [-1, -1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1],
+    [-1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10, -1],
+    [5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10],
+    [-1, 5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1],
+    [-1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1, -1],
+    [-1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1],
+    [10, -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15],
+];
+
+/// `Matrix::row::<u8, 3>` (not identity), 16 pixels at a time in AVX2: the same
+/// `f32` expressions in the same order, [`quantize_without_round`]'s exact
+/// rounding, then packed to bytes and interleaved with byte shuffles. Returns
+/// how many pixels it converted; the caller does the rest.
+#[cfg(target_arch = "x86_64")]
+struct Row8Avx2<'a> {
+    simd: pulp::x86::V3,
+    m: &'a Matrix,
+    pixels: &'a mut [[u8; 3]],
+    luma: &'a [i32],
+    cb: &'a [f32],
+    cr: &'a [f32],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for Row8Avx2<'_> {
+    type Output = usize;
+
+    #[inline(always)]
+    fn call(self) -> usize {
+        use core::arch::x86_64::__m128i;
+        use pulp::bytemuck::cast;
+        let Row8Avx2 { simd, m, pixels, luma, cb, cr } = self;
+        let avx = simd.avx;
+        let k = Consts {
+            y_offset: avx._mm256_set1_ps(m.y_offset), y_scale: avx._mm256_set1_ps(m.y_scale),
+            c_offset: avx._mm256_set1_ps(m.c_offset), c_scale: avx._mm256_set1_ps(m.c_scale),
+            red_cr: avx._mm256_set1_ps(m.red_cr), green_cb: avx._mm256_set1_ps(m.green_cb),
+            green_cr: avx._mm256_set1_ps(m.green_cr), blue_cb: avx._mm256_set1_ps(m.blue_cb),
+        };
+        let masks: [__m128i; 9] = cast(INTERLEAVE);
+        let (px, _) = pixels.as_chunks_mut::<16>();
+        let (ys, _) = luma.as_chunks::<8>();
+        let (cbs, _) = cb.as_chunks::<8>();
+        let (crs, _) = cr.as_chunks::<8>();
+        let mut done = 0;
+        for (i, out) in px.iter_mut().enumerate() {
+            let (Some(y0), Some(y1), Some(cb0), Some(cb1), Some(cr0), Some(cr1)) =
+                (ys.get(2 * i), ys.get(2 * i + 1), cbs.get(2 * i), cbs.get(2 * i + 1), crs.get(2 * i), crs.get(2 * i + 1))
+            else {
+                break;
+            };
+            let lo = rgb_lanes(simd, &k, cast(*y0), cast(*cb0), cast(*cr0));
+            let hi = rgb_lanes(simd, &k, cast(*y1), cast(*cb1), cast(*cr1));
+            let (r, g, b) = (to_bytes(simd, lo[0], hi[0]), to_bytes(simd, lo[1], hi[1]), to_bytes(simd, lo[2], hi[2]));
+            *out = cast::<[__m128i; 3], [[u8; 3]; 16]>([
+                interleave(simd, r, g, b, &masks, 0),
+                interleave(simd, r, g, b, &masks, 1),
+                interleave(simd, r, g, b, &masks, 2),
+            ]);
+            done += 16;
+        }
+        done
+    }
+}
+
+/// Two vectors of eight 0..=255 lanes as 16 bytes, in order.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn to_bytes(simd: pulp::x86::V3, lo: core::arch::x86_64::__m256i, hi: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m128i {
+    let p16 = simd.avx2._mm256_permute4x64_epi64::<0xD8>(simd.avx2._mm256_packus_epi32(lo, hi));
+    simd.sse2._mm_packus_epi16(simd.avx._mm256_castsi256_si128(p16), simd.avx2._mm256_extracti128_si256::<1>(p16))
+}
+
+/// Output block `j` (16 of the 48 bytes) of 16 interleaved RGB pixels.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn interleave(
+    simd: pulp::x86::V3, r: core::arch::x86_64::__m128i, g: core::arch::x86_64::__m128i, b: core::arch::x86_64::__m128i,
+    masks: &[core::arch::x86_64::__m128i; 9], j: usize,
+) -> core::arch::x86_64::__m128i {
+    let (sse2, ssse3) = (simd.sse2, simd.ssse3);
+    sse2._mm_or_si128(sse2._mm_or_si128(ssse3._mm_shuffle_epi8(r, masks[3 * j]), ssse3._mm_shuffle_epi8(g, masks[3 * j + 1])), ssse3._mm_shuffle_epi8(b, masks[3 * j + 2]))
+}
+
+#[cfg(target_arch = "x86_64")]
+struct Consts {
+    y_offset: core::arch::x86_64::__m256,
+    y_scale: core::arch::x86_64::__m256,
+    c_offset: core::arch::x86_64::__m256,
+    c_scale: core::arch::x86_64::__m256,
+    red_cr: core::arch::x86_64::__m256,
+    green_cb: core::arch::x86_64::__m256,
+    green_cr: core::arch::x86_64::__m256,
+    blue_cb: core::arch::x86_64::__m256,
+}
+
+/// Eight pixels' R, G and B as 0..=255 in `i32` lanes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rgb_lanes(
+    simd: pulp::x86::V3, k: &Consts, y: core::arch::x86_64::__m256i, cb: core::arch::x86_64::__m256, cr: core::arch::x86_64::__m256,
+) -> [core::arch::x86_64::__m256i; 3] {
+    let avx = simd.avx;
+    let y = avx._mm256_mul_ps(avx._mm256_sub_ps(avx._mm256_cvtepi32_ps(y), k.y_offset), k.y_scale);
+    let cb = avx._mm256_mul_ps(avx._mm256_sub_ps(cb, k.c_offset), k.c_scale);
+    let cr = avx._mm256_mul_ps(avx._mm256_sub_ps(cr, k.c_offset), k.c_scale);
+    [
+        quantize8_lanes(simd, avx._mm256_add_ps(y, avx._mm256_mul_ps(k.red_cr, cr))),
+        quantize8_lanes(simd, avx._mm256_add_ps(avx._mm256_add_ps(y, avx._mm256_mul_ps(k.green_cb, cb)), avx._mm256_mul_ps(k.green_cr, cr))),
+        quantize8_lanes(simd, avx._mm256_add_ps(y, avx._mm256_mul_ps(k.blue_cb, cb))),
+    ]
+}
+
+/// [`quantize_without_round`] to 0..=255 in eight lanes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn quantize8_lanes(simd: pulp::x86::V3, v: core::arch::x86_64::__m256) -> core::arch::x86_64::__m256i {
+    const TWO_23: f32 = 8_388_608.0;
+    let (avx, avx2) = (simd.avx, simd.avx2);
+    let (zero, full, two_23, half) = (avx._mm256_set1_ps(0.0), avx._mm256_set1_ps(255.0), avx._mm256_set1_ps(TWO_23), avx._mm256_set1_ps(0.5));
+    let clamped = avx._mm256_min_ps(avx._mm256_max_ps(avx._mm256_mul_ps(v, full), zero), full);
+    let shifted = avx._mm256_add_ps(clamped, two_23);
+    let nearest = avx2._mm256_sub_epi32(avx._mm256_castps_si256(shifted), avx._mm256_set1_epi32(TWO_23.to_bits() as i32));
+    let tie = avx._mm256_castps_si256(avx._mm256_cmp_ps::<0>(avx._mm256_sub_ps(clamped, avx._mm256_sub_ps(shifted, two_23)), half));
+    // a tie is all ones (-1): subtracting it adds one
+    avx2._mm256_sub_epi32(nearest, tie)
 }
 
 /// An alpha sample as [`DecodedImage::to_rgba8`] scales it to 0..=255.
