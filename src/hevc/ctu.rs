@@ -550,6 +550,16 @@ impl Picture {
         Some((&mut self.y, &self.flags, &self.qp_y, self.min_pu_width, self.slice_start_y))
     }
 
+    /// For deblocking an intra picture's chroma: both chroma planes, and beside
+    /// them the per-min-PU flags and `QpY`, the min-PU row width and the
+    /// slice's first row. `None` once any PU is inter-coded.
+    pub(crate) fn chroma_deblock_parts(&mut self) -> Option<(&mut Plane, &mut Plane, &[u8], &[i8], usize, usize)> {
+        if !self.motions.is_empty() {
+            return None;
+        }
+        Some((&mut self.cb, &mut self.cr, &self.flags, &self.qp_y, self.min_pu_width, self.slice_start_y))
+    }
+
     pub(crate) fn has_bypass(&self) -> bool {
         self.flags.iter().any(|&f| f & BYPASS != 0)
     }

@@ -314,7 +314,76 @@ pub fn deblock_picture(pic: &mut Picture, sps: &Sps, beta_offset_div2: i32, tc_o
     if !luma_intra(pic, width, height, beta_offset, tc_offset)? {
         luma_any(pic, width, height, beta_offset, tc_offset)?;
     }
+    if chroma_intra(pic, sps, width, height, tc_offset, cb_qp_offset, cr_qp_offset)? {
+        return Ok(());
+    }
     chroma_edges(pic, sps, width, height, tc_offset, cb_qp_offset, cr_qp_offset)
+}
+
+/// Chroma edges of an intra picture straight from the per-min-PU maps, as
+/// [`luma_intra`] does for luma: every CU or TU edge has `bS == 2`, so a
+/// segment's edge test and `QpY` lookups are made once for both chroma planes.
+/// The same segments, `tc` and filter as [`chroma_edges`]; each plane still
+/// gets all its vertical edges before its horizontal ones.
+fn chroma_intra(pic: &mut Picture, sps: &Sps, width: usize, height: usize, tc_offset: i32, cb_qp_offset: i32, cr_qp_offset: i32) -> Result<bool> {
+    if *NO_INTRA_CHROMA || sps.chroma_format_idc == 0 {
+        return Ok(sps.chroma_format_idc == 0);
+    }
+    let any_bypass = pic.has_bypass();
+    let Some((cb, cr, flags, qp, w4, slice_start_y)) = pic.chroma_deblock_parts() else { return Ok(false) };
+    let (format, bit_depth) = (sps.chroma_format_idc, sps.bit_depth_chroma as i32);
+    let (sub_w, sub_h) = (sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+    let (x_step_vert, y_step_vert) = (8 * sub_w, 4 * sub_h);
+    let (x_step_horiz, y_step_horiz) = (4 * sub_w, 8 * sub_h);
+    let (seg_h_chroma, seg_w_chroma) = ((y_step_vert / sub_h).max(1) as i64, (x_step_horiz / sub_w).max(1) as i64);
+    let qp_at = |i: usize, y: usize| if y < slice_start_y { 0 } else { qp.get(i).map_or(0, |&q| i32::from(q)) };
+    let bypass = |i: usize| any_bypass && flags.get(i).is_some_and(|&f| f & super::ctu::BYPASS != 0);
+    let tc_for = |qp_l: i32, qp_offset: i32| -> i32 {
+        let qp_i = qp_l + qp_offset;
+        let qp_c = if format == 1 { chroma_qp_mapping(qp_i) } else { qp_i.min(51) };
+        let q_tc = clip3(0, 53, qp_c + 2 + tc_offset) as usize;
+        TC_PRIME.get(q_tc).map_or(0, |&t| t << (bit_depth - 8))
+    };
+    let (left, top) = (super::ctu::CU_EDGE_LEFT | super::ctu::TU_EDGE_LEFT, super::ctu::CU_EDGE_TOP | super::ctu::TU_EDGE_TOP);
+    for ly in (0..height).step_by(y_step_vert) {
+        let row = (ly / 4) * w4;
+        for lx in (x_step_vert..width).step_by(x_step_vert) {
+            let iq = row + lx / 4;
+            if flags.get(iq).is_none_or(|&f| f & left == 0) {
+                continue;
+            }
+            let ip = row + (lx - 1) / 4;
+            let qp_l = (qp_at(ip, ly) + qp_at(iq, ly) + 1) >> 1;
+            let (pp, pq) = (bypass(ip), bypass(iq));
+            let (cx, cy0) = ((lx / sub_w) as i64, (ly / sub_h) as i64);
+            for (plane, offset) in [(&mut *cb, cb_qp_offset), (&mut *cr, cr_qp_offset)] {
+                let tc = tc_for(qp_l, offset);
+                if tc != 0 {
+                    filter_chroma_segment(plane, cx, cy0, seg_h_chroma, true, tc, pp, pq);
+                }
+            }
+        }
+    }
+    for ly in (y_step_horiz..height).step_by(y_step_horiz) {
+        let (row, row_p) = ((ly / 4) * w4, ((ly - 1) / 4) * w4);
+        for lx in (0..width).step_by(x_step_horiz) {
+            let iq = row + lx / 4;
+            if flags.get(iq).is_none_or(|&f| f & top == 0) {
+                continue;
+            }
+            let ip = row_p + lx / 4;
+            let qp_l = (qp_at(ip, ly - 1) + qp_at(iq, ly) + 1) >> 1;
+            let (pp, pq) = (bypass(ip), bypass(iq));
+            let (cx0, cy) = ((lx / sub_w) as i64, (ly / sub_h) as i64);
+            for (plane, offset) in [(&mut *cb, cb_qp_offset), (&mut *cr, cr_qp_offset)] {
+                let tc = tc_for(qp_l, offset);
+                if tc != 0 {
+                    filter_chroma_segment(plane, cx0, cy, seg_w_chroma, false, tc, pp, pq);
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Luma edges of an intra picture straight from the per-min-PU maps: every
@@ -387,6 +456,9 @@ fn luma_intra(pic: &mut Picture, width: usize, height: usize, beta_offset: i32, 
 
 /// `HEIC_NO_INTRA_DEBLOCK=1`: luma edges through [`filter_luma_segment`] (A/B runs).
 static NO_INTRA_FAST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_INTRA_DEBLOCK").as_deref() == Ok("1"));
+
+/// `HEIC_NO_INTRA_CHROMA=1`: chroma edges through [`chroma_edges`] (A/B runs).
+static NO_INTRA_CHROMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_INTRA_CHROMA").as_deref() == Ok("1"));
 
 fn luma_any(pic: &mut Picture, width: usize, height: usize, beta_offset: i32, tc_offset: i32) -> Result<()> {
     let mut x = 8usize;
