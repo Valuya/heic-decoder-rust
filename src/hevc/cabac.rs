@@ -319,6 +319,31 @@ impl<'a, 'b> Engine<'a, 'b> {
         Ok(v)
     }
 
+    /// A short `coeff_abs_level_remaining` from one division: a unary prefix
+    /// of at most 3 ones, its terminating 0 and `rice` suffix bins, when all of
+    /// them lie in the next 8 bypass bins (the quotient [`Engine::bypass_unary`]
+    /// computes holds the suffix too). `Some((prefix, suffix))` with the bins
+    /// consumed, or `None` with nothing consumed (then decode it bin run by run).
+    #[inline(always)]
+    pub fn bypass_rice_short(&mut self, rice: u32) -> Option<(u32, u32)> {
+        if self.cache_bits < 8 || self.offset >= self.range || rice > 4 {
+            return None;
+        }
+        let bits = (self.cache >> 56) as u32;
+        let quotient = ((self.offset << 8) | bits) / self.range;
+        let leading = (!(quotient << 24)).leading_zeros();
+        let take = leading + 1 + rice;
+        if leading > 3 || take > 8 {
+            return None;
+        }
+        let q = quotient >> (8 - take);
+        let dividend = (self.offset << take) | (bits >> (8 - take));
+        self.offset = dividend - q * self.range;
+        self.cache <<= take;
+        self.cache_bits -= take;
+        Some((leading, q & ((1 << rice) - 1)))
+    }
+
     /// A unary run of bypass bins: the 1-bins up to and including the 0
     /// that ends them, or `max_ones` 1-bins and nothing more. Returns the
     /// number of 1-bins.
@@ -498,6 +523,51 @@ mod tests {
                 assert_eq!((fast.range, fast.offset, fast.overread), (slow.range, slow.offset, slow.overread), "cut {cut} run {i}");
                 assert_eq!(fast.decision(&mut ctx_a).unwrap(), slow.reference_decision(&mut ctx_b));
             }
+        }
+    }
+
+    #[test]
+    fn short_rice_codes_match_bin_by_bin() {
+        let mut seed = 0x8CB9_2BA7_2F3D_8DD7u64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        for cut in [data.len(), 37, 11, 3] {
+            let data = &data[..cut];
+            let (mut r1, mut r2) = (BitReader::new(data), BitReader::new(data));
+            let (mut fast, mut slow) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
+            let (mut ctx_a, mut taken) = (ContextModel::new(20, 1), 0);
+            let mut ctx_b = ctx_a;
+            for i in 0..3000u32 {
+                let rice = i % 5;
+                let before = (fast.range, fast.offset, fast.cache_bits);
+                let (prefix, suffix) = match fast.bypass_rice_short(rice) {
+                    Some(code) => {
+                        taken += 1;
+                        code
+                    }
+                    None => {
+                        // Nothing consumed; then the runs the caller falls back to.
+                        assert_eq!(before, (fast.range, fast.offset, fast.cache_bits), "cut {cut} code {i}");
+                        let prefix = fast.bypass_unary(4).unwrap();
+                        (prefix, if prefix <= 3 { fast.bypass_fl(rice).unwrap() } else { 0 })
+                    }
+                };
+                let mut want_prefix = 0;
+                while want_prefix < 4 && slow.bypass().unwrap() == 1 {
+                    want_prefix += 1;
+                }
+                let want_suffix = if want_prefix <= 3 { (0..rice).fold(0, |v, _| (v << 1) | slow.bypass().unwrap()) } else { 0 };
+                assert_eq!((prefix, suffix), (want_prefix, want_suffix), "cut {cut} code {i}");
+                assert_eq!((fast.range, fast.offset, fast.overread), (slow.range, slow.offset, slow.overread), "cut {cut} code {i}");
+                assert_eq!(fast.decision(&mut ctx_a).unwrap(), slow.reference_decision(&mut ctx_b));
+            }
+            assert!(cut < 64 || taken > 1000, "cut {cut}: only {taken} short codes");
         }
     }
 

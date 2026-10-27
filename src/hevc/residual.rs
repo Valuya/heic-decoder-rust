@@ -151,6 +151,11 @@ fn sig_ctx_row(log2_trafo_size: u32, is_chroma: bool, scan_idx: u32, prev_csbf: 
 
 fn decode_coeff_abs_level_remaining(engine: &mut Engine, rice_param: u32) -> Result<u32> {
     const MAX_PREFIX: u32 = 15 + 3;
+    if !*NO_RICE_SHORT
+        && let Some((prefix, codeword)) = engine.bypass_rice_short(rice_param)
+    {
+        return Ok((prefix << rice_param) + codeword);
+    }
     // As the bin-by-bin loop did: past MAX_PREFIX ones, stop and give 0.
     let prefix = engine.bypass_unary(MAX_PREFIX + 1)?;
     if prefix > MAX_PREFIX {
@@ -401,6 +406,10 @@ pub fn decode_residual(
 
     Ok(if dc_only { CoeffBox { width: 1, height: 1 } } else { CoeffBox { width: max_x as usize + 1, height: max_y as usize + 1 } })
 }
+
+
+/// `HEIC_NO_RICE_SHORT=1`: every remaining level as a prefix run then a suffix run (A/B runs).
+static NO_RICE_SHORT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_RICE_SHORT").as_deref() == Ok("1"));
 
 #[cfg(test)]
 mod tests {
