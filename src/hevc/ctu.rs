@@ -100,41 +100,41 @@ pub struct Plane {
     pub height: usize,
     pub bit_depth: u32,
     samples: Samples,
-    /// One bit per sample, row-major: set once the CTU decode driver has
-    /// written it.
-    decoded: Vec<u64>,
-}
-
-/// Sets bits `start..start + len`, all inside `bits`.
-fn mark_decoded(bits: &mut [u64], start: usize, len: usize) {
-    let end = start + len;
-    let mut at = start;
-    while at < end {
-        let (word, bit) = (at / 64, at % 64);
-        let take = (64 - bit).min(end - at);
-        let mask = if take == 64 { u64::MAX } else { ((1u64 << take) - 1) << bit };
-        if let Some(w) = bits.get_mut(word) {
-            *w |= mask;
-        }
-        at += take;
-    }
+    /// One byte per 4x4 unit, row-major, set once the CTU decode driver has
+    /// written the unit (every block is a whole number of units).
+    decoded: Vec<u8>,
+    /// Units per row of `decoded`.
+    units_w: usize,
 }
 
 impl Plane {
     fn empty() -> Self {
-        Plane { width: 0, height: 0, bit_depth: 8, samples: Samples::Narrow(Vec::new()), decoded: Vec::new() }
+        Plane { width: 0, height: 0, bit_depth: 8, samples: Samples::Narrow(Vec::new()), decoded: Vec::new(), units_w: 0 }
     }
 
     /// `width x height` zeros, none decoded, keeping the buffers.
     fn reset(&mut self, width: usize, height: usize, bit_depth: u32) {
         (self.width, self.height, self.bit_depth) = (width, height, bit_depth);
         self.samples.reset(bit_depth, width * height);
+        self.units_w = width.div_ceil(4);
         self.decoded.clear();
-        self.decoded.resize((width * height).div_ceil(64), 0);
+        self.decoded.resize(self.units_w * height.div_ceil(4), 0);
     }
 
-    fn is_decoded(&self, index: usize) -> bool {
-        self.decoded.get(index / 64).is_some_and(|word| word >> (index % 64) & 1 != 0)
+    #[inline(always)]
+    fn is_decoded(&self, x: usize, y: usize) -> bool {
+        self.decoded.get((y / 4) * self.units_w + x / 4).is_some_and(|&u| u != 0)
+    }
+
+    /// Marks the units covering the `w x h` block at `(x0, y0)` decoded.
+    #[inline(always)]
+    fn mark_decoded(&mut self, x0: usize, y0: usize, w: usize, h: usize) {
+        let (ux0, ux1) = (x0 / 4, (x0 + w).div_ceil(4).min(self.units_w));
+        for uy in y0 / 4..(y0 + h).div_ceil(4) {
+            if let Some(row) = self.decoded.get_mut(uy * self.units_w + ux0..uy * self.units_w + ux1) {
+                row.fill(1);
+            }
+        }
     }
 
     fn get(&self, x: i64, y: i64) -> Option<i32> {
@@ -142,7 +142,7 @@ impl Plane {
             return None;
         }
         let idx = y as usize * self.width + x as usize;
-        if self.is_decoded(idx) { self.samples.get(idx) } else { None }
+        if self.is_decoded(x as usize, y as usize) { self.samples.get(idx) } else { None }
     }
 
     /// Intra border samples straight from the plane, in [`Border`]'s order
@@ -172,7 +172,7 @@ impl Plane {
     #[allow(clippy::too_many_arguments)]
     fn border_groups<T: Sample>(&self, s: &[T], x0: usize, y0: usize, nt: usize, start_y: usize, data: &mut [i32], avail: &mut [bool]) {
         let w = self.width;
-        let available = |x: usize, y: usize| y >= start_y && x < w && y < self.height && self.is_decoded(y * w + x);
+        let available = |x: usize, y: usize| y >= start_y && x < w && y < self.height && self.is_decoded(x, y);
         let n2 = 2 * nt;
         if x0 > 0 {
             let x = x0 - 1;
@@ -243,7 +243,7 @@ impl Plane {
         }
         let idx = y * self.width + x;
         self.samples.set(idx, v).ok_or(HeifError::MalformedHevc("plane write out of bounds"))?;
-        mark_decoded(&mut self.decoded, idx, 1);
+        self.mark_decoded(x, y, 1, 1);
         Ok(())
     }
 
@@ -264,8 +264,8 @@ impl Plane {
                     samples.get_mut(start..start + n).ok_or_else(out_of_bounds)?.iter_mut().zip(source).for_each(|(d, &s)| *d = u16::narrow(s))
                 }
             }
-            mark_decoded(&mut self.decoded, start, n);
         }
+        self.mark_decoded(x0, y0, n, n);
         Ok(())
     }
 
@@ -281,9 +281,7 @@ impl Plane {
                 && samples.len() >= (y0 + n - 1) * width + x0 + n
             {
                 simd.vectorize(SumWrite { simd, samples, width, x0, y0, n, pred, res });
-                for row in 0..n {
-                    mark_decoded(&mut self.decoded, (y0 + row) * width + x0, n);
-                }
+                self.mark_decoded(x0, y0, n, n);
                 return true;
             }
         }
