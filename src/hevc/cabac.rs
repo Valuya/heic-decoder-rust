@@ -161,6 +161,17 @@ impl<'a, 'b> Engine<'a, 'b> {
 
     #[inline(never)]
     fn refill(&mut self) {
+        // Eight bytes at once where they exist: the whole bytes that fit are
+        // claimed; bits past them are the stream's next bits, so OR-ing them
+        // again on the next refill changes nothing.
+        if let Some(bytes) = self.data.get(self.pos..self.pos + 8) {
+            let word = u64::from_be_bytes(bytes.try_into().unwrap_or([0; 8]));
+            let take = (64 - self.cache_bits) & !7;
+            self.cache |= word >> self.cache_bits;
+            self.cache_bits += take;
+            self.pos += (take / 8) as usize;
+            return;
+        }
         while self.cache_bits <= 56 {
             let Some(&byte) = self.data.get(self.pos) else { break };
             self.cache |= u64::from(byte) << (56 - self.cache_bits);
