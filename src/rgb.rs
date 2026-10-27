@@ -513,9 +513,16 @@ impl AlphaOver {
 impl Sink {
     fn full(width: usize, height: usize) -> Result<Self> {
         let len = width.checked_mul(height).and_then(|p| p.checked_mul(3)).ok_or(HeifError::LimitExceeded("RGB: output size"))?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| HeifError::LimitExceeded("RGB: output allocation failed"))?;
-        data.resize(len, 0);
+        // Probe that the allocation can succeed, then take it zeroed from the
+        // allocator (fresh pages for a picture, no pass writing zeros).
+        Vec::<u8>::new().try_reserve_exact(len).map_err(|_| HeifError::LimitExceeded("RGB: output allocation failed"))?;
+        let data = if *ZERO_FILL {
+            let mut data = Vec::with_capacity(len);
+            data.resize(len, 0);
+            data
+        } else {
+            vec![0; len]
+        };
         Ok(Sink::Full { width, data })
     }
 
@@ -1303,15 +1310,11 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
 fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) -> Vec<[u8; 3]> {
     let samples = luma.get(y);
     let Some(ry) = rows.entries[y] else { return Vec::new() };
-    let mut out = vec![[0u8; 3]; samples.len()];
     if pixel.monochrome() {
-        for (o, &s) in out.iter_mut().zip(samples) {
-            *o = pixel.rgb8(i32::from(s), 0.0, 0.0);
-        }
-        return out;
+        return samples.iter().map(|&s| pixel.rgb8(i32::from(s), 0.0, 0.0)).collect();
     }
     if let Some((lo0, phase, last)) = columns.halves
-        && std::env::var("HEIC_NO_FUSED").as_deref() != Ok("1")
+        && !*NO_FUSED
     {
         let (cb_row, cr_row) = (cb.get(ry.lo), cr.get(ry.lo));
         let chroma = |x: usize| {
@@ -1337,6 +1340,7 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
     let pick = |row: &[u16]| -> Vec<f32> { columns.lo.iter().map(|&lo| at(row, lo) as f32).collect() };
     let (cb_row, cr_row) = (pick(cb.get(ry.lo)), pick(cr.get(ry.lo)));
     let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
+    let mut out = vec![[0u8; 3]; samples.len()];
     pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
     out
 }
@@ -1420,3 +1424,7 @@ mod tests {
 
 /// `HEIC_NO_TURN_BLOCKS=1`: gather turned rows pixel by pixel (A/B runs).
 static NO_TURN_BLOCKS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_TURN_BLOCKS").as_deref() == Ok("1"));
+/// `HEIC_NO_FUSED=1`: nearest 4:2:0 rows through the general row loop (A/B runs).
+static NO_FUSED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_NO_FUSED").as_deref() == Ok("1"));
+/// `HEIC_ZERO_FILL=1`: the output written with zeros first, as before (A/B runs).
+static ZERO_FILL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_ZERO_FILL").as_deref() == Ok("1"));
