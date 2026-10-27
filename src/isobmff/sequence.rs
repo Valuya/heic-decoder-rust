@@ -111,7 +111,7 @@ fn locate_sample(stsc: &[u8], offsets: &[u8], wide: bool, sizes: &Sizes<'_>, sam
     Err(HeifError::MalformedBox("sequence: sample not covered by chunks"))
 }
 
-pub(super) fn parse(file: &[u8], moov: &[u8]) -> Result<ParsedHeif> {
+pub(super) fn parse<'f>(file: &'f [u8], moov: &[u8]) -> Result<ParsedHeif<'f>> {
     let tracks = children(moov, b"trak")?;
     let mut selected = None;
     // Prefer image tracks regardless of their order relative to video tracks.
@@ -246,7 +246,7 @@ pub(super) fn parse(file: &[u8], moov: &[u8]) -> Result<ParsedHeif> {
         overlay: None,
         transforms,
         metadata,
-        images: vec![ResolvedImage { hevc_config, data }],
+        images: vec![ResolvedImage { hevc_config, data: data.into() }],
         sequence: Some(SequenceFrameInfo { track_id, sample_number, sample_count: sizes.count }),
     })
 }

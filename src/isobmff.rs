@@ -9,6 +9,7 @@
 //! other implementation's source.
 
 use crate::bitreader::ByteReader;
+use std::borrow::Cow;
 use crate::error::{HeifError, Result};
 use std::collections::BTreeMap;
 
@@ -341,7 +342,7 @@ fn parse_grid_descriptor(body: &[u8]) -> Result<GridInfo> {
 /// An `iovl` derived image (ISO/IEC 23008-12 clause 6.6.2.2): input images
 /// placed, in reference order, on a canvas filled with one colour.
 #[derive(Debug, Clone)]
-pub struct OverlayInfo {
+pub struct OverlayInfo<'a> {
     /// `canvas_fill_value`: red, green, blue and alpha, 16 bits each.
     pub canvas_fill: [u16; 4],
     pub output_width: u32,
@@ -349,7 +350,7 @@ pub struct OverlayInfo {
     /// Placements in `dimg` reference order, later ones drawn over earlier ones.
     pub inputs: Vec<OverlayInput>,
     /// Each distinct input item, resolved once with its own alpha and transforms.
-    pub images: Vec<ParsedHeif>,
+    pub images: Vec<ParsedHeif<'a>>,
 }
 
 /// One input of an overlay: `images[image]` with its top-left corner at
@@ -402,11 +403,12 @@ fn parse_overlay_descriptor(body: &[u8], inputs: usize) -> Result<OverlayDescrip
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedImage {
+pub struct ResolvedImage<'a> {
     pub hevc_config: HevcDecoderConfig,
     /// Same ISOBMFF length-prefixed "sample" form as `ParsedHeif`
-    /// previously documented for `primary_item_data`.
-    pub data: Vec<u8>,
+    /// previously documented for `primary_item_data`. Borrowed from the file
+    /// when the item is one extent of it, so a grid's tiles are not copied.
+    pub data: Cow<'a, [u8]>,
 }
 
 /// The single sync sample selected from a sequence, not animation playback.
@@ -420,17 +422,17 @@ pub struct SequenceFrameInfo {
 
 /// Resolved auxiliary alpha image. Its own transforms are applied separately.
 #[derive(Debug, Clone)]
-pub struct AuxiliaryAlpha {
-    pub image: Box<ParsedHeif>,
+pub struct AuxiliaryAlpha<'a> {
+    pub image: Box<ParsedHeif<'a>>,
     /// `prem` links the colour image to this alpha image.
     pub premultiplied: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct ParsedHeif {
-    pub alpha: Option<AuxiliaryAlpha>,
+pub struct ParsedHeif<'a> {
+    pub alpha: Option<AuxiliaryAlpha<'a>>,
     /// Single coded reference image for the restricted IDR-to-P path.
-    pub reference_image: Option<ResolvedImage>,
+    pub reference_image: Option<ResolvedImage<'a>>,
     /// Present when returning a sequence preview rather than a still item.
     pub sequence: Option<SequenceFrameInfo>,
     /// Primary still-item ID, or the selected track ID for a sequence preview.
@@ -442,8 +444,8 @@ pub struct ParsedHeif {
     pub grid: Option<GridInfo>,
     /// `Some` when the image is an `iovl` overlay; `images` is then empty and
     /// the coded images are those of the overlay's inputs.
-    pub overlay: Option<OverlayInfo>,
-    pub images: Vec<ResolvedImage>,
+    pub overlay: Option<OverlayInfo<'a>>,
+    pub images: Vec<ResolvedImage<'a>>,
     /// Source and enclosing identity items' `clap`/`irot`/`imir` properties,
     /// applied source-first to the fully assembled picture.
     pub transforms: Vec<Transform>,
@@ -495,7 +497,7 @@ pub fn split_length_prefixed_nalus(data: &[u8], length_size: usize) -> Result<Ve
 
 /// Parses a HEIF file, resolving the primary image item's HEVC
 /// configuration and coded sample bytes.
-pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
+pub fn parse(file: &[u8]) -> Result<ParsedHeif<'_>> {
     let _timer = crate::timing::start(crate::timing::Stage::Container);
     let mut saw_ftyp = false;
     let mut meta_body_range: Option<(usize, usize)> = None;
@@ -638,7 +640,7 @@ enum Resolve {
     Alpha,
 }
 
-fn resolve_item(file: &[u8], meta: &Meta, primary_item_id: u32, role: Resolve) -> Result<ParsedHeif> {
+fn resolve_item<'f>(file: &'f [u8], meta: &Meta, primary_item_id: u32, role: Resolve) -> Result<ParsedHeif<'f>> {
     let Meta { iloc, item_types, xmp_items, ipco_bodies, ipco_kinds, ipma, idat, iref_body, .. } = meta;
     let iloc = iloc.as_ref().ok_or(HeifError::NotHeif("missing iloc box"))?;
     let iref_body = iref_body.as_deref();
@@ -683,7 +685,7 @@ fn resolve_item(file: &[u8], meta: &Meta, primary_item_id: u32, role: Resolve) -
         color_info: resolve_color_info(ipma, ipco_kinds, ipco_bodies, &chain)?,
         icc_profile: resolve_icc(ipma, ipco_kinds, ipco_bodies, &chain),
         exif: metadata_item(&exif_items).and_then(|payload| exif_tiff(&payload)),
-        xmp: metadata_item(xmp_items),
+        xmp: metadata_item(xmp_items).map(Cow::into_owned),
     };
     let parsed =
         |grid, overlay, images, metadata| ParsedHeif { alpha, reference_image, sequence: None, primary_item_id, grid, overlay, images, transforms, metadata };
@@ -801,7 +803,7 @@ fn auxiliary_links(body: &[u8], wanted: &[u8; 4]) -> Result<BTreeMap<u32, Vec<u3
 
 // Alpha is identified by its auxiliary type AND an auxl link to the selected
 // image/identity chain. Depth maps and unrelated auxiliary images are ignored.
-fn resolve_alpha(file: &[u8], meta: &Meta, chain: &[u32]) -> Result<Option<AuxiliaryAlpha>> {
+fn resolve_alpha<'f>(file: &'f [u8], meta: &Meta, chain: &[u32]) -> Result<Option<AuxiliaryAlpha<'f>>> {
     let Meta { item_types: types, ipma, ipco_kinds: kinds, ipco_bodies: bodies, .. } = meta;
     let Some(references) = meta.iref_body.as_deref() else {
         return Ok(None);
@@ -950,8 +952,17 @@ fn identity_chain(types: &BTreeMap<u32, [u8; 4]>, references: Option<&[u8]>, pri
 /// Resolves one item's coded bytes via its `iloc` entry (concatenating
 /// all of its extents), following `construction_method 0`/`1` (file- or
 /// `idat`-relative offsets).
-fn resolve_item_bytes(file: &[u8], idat: &[u8], iloc: &BTreeMap<u32, IlocEntry>, item_id: u32) -> Result<Vec<u8>> {
+fn resolve_item_bytes<'f>(file: &'f [u8], idat: &[u8], iloc: &BTreeMap<u32, IlocEntry>, item_id: u32) -> Result<Cow<'f, [u8]>> {
     let entry = iloc.get(&item_id).ok_or(HeifError::MalformedBox("item has no iloc entry"))?;
+    if let ([extent], ConstructionMethod::FileOffset, false) = (entry.extents.as_slice(), entry.construction_method, *COPY_ITEMS) {
+        let start = entry.base_offset.checked_add(extent.offset).ok_or(HeifError::MalformedBox("iloc offset overflow"))?;
+        let start = usize::try_from(start).map_err(|_| HeifError::MalformedBox("iloc offset overflow"))?;
+        let len = usize::try_from(extent.length).map_err(|_| HeifError::MalformedBox("iloc length overflow"))?;
+        return file
+            .get(start..start.checked_add(len).ok_or(HeifError::MalformedBox("iloc end overflow"))?)
+            .map(Cow::Borrowed)
+            .ok_or(HeifError::Truncated { at: start, needed: len });
+    }
     let mut data = Vec::new();
     for extent in &entry.extents {
         let start = entry.base_offset.checked_add(extent.offset).ok_or(HeifError::MalformedBox("iloc offset overflow"))?;
@@ -968,8 +979,11 @@ fn resolve_item_bytes(file: &[u8], idat: &[u8], iloc: &BTreeMap<u32, IlocEntry>,
         };
         data.extend_from_slice(bytes);
     }
-    Ok(data)
+    Ok(Cow::Owned(data))
 }
+
+/// `HEIC_COPY_ITEMS=1`: every item's bytes copied, as before (A/B runs).
+static COPY_ITEMS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HEIC_COPY_ITEMS").as_deref() == Ok("1"));
 
 /// An orientation-changing item property (ISO/IEC 23008-12 clause
 /// 6.5.10 `irot` / 6.5.12 `imir`) associated with the primary item,
