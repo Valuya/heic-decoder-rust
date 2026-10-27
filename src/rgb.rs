@@ -1115,6 +1115,21 @@ fn convert(
         }
         for batch in (next_y..ready).step_by(ROWS_PER_BATCH) {
             let batch_end = (batch + ROWS_PER_BATCH).min(ready);
+            // Upright, no interpolation, whole rows kept in order: each source row
+            // is converted straight into its output row.
+            if let (true, false, None, Some((0, 0, len, false)), Sink::Full { width, data }) = (flat, turned, alpha.as_ref(), scatter.span, &mut sink)
+                && len == *width
+            {
+                let row = *width * 3;
+                let touched = scatter.rows_touched(batch, batch_end - batch, data.len() / row.max(1));
+                let start = touched.start;
+                data[touched.start * row..touched.end * row].par_chunks_mut(row).enumerate().for_each(|(i, out)| {
+                    let Some(y) = scatter.source_of_row[start + i].filter(|y| (batch..batch_end).contains(y)) else { return };
+                    let mut out = crate::color::InPlace { row: out.as_chunks_mut::<3>().0, at: 0 };
+                    flat_row_to(&mut out, y, &luma, &cb, &cr, &column_arrays, &rows_axis, &pixel);
+                });
+                continue;
+            }
             let converted: Vec<Vec<[u8; 3]>> = if flat {
                 // No interpolation anywhere: each pixel's chroma is one sample.
                 (batch..batch_end).into_par_iter().map(|y| flat_row(y, &luma, &cb, &cr, &column_arrays, &rows_axis, &pixel)).collect()
@@ -1302,10 +1317,24 @@ fn convert_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, r
 /// non-negative integers samples are. Upright or turned, that sample is
 /// chroma row `ry.lo` at column `columns.lo[x]`.
 fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) -> Vec<[u8; 3]> {
+    let mut out = Vec::new();
+    if rows.entries[y].is_some() {
+        out.reserve_exact(luma.get(y).len());
+        flat_row_to(&mut out, y, luma, cb, cr, columns, rows, pixel);
+    }
+    out
+}
+
+/// [`flat_row`] written to `out`.
+#[allow(clippy::too_many_arguments)]
+fn flat_row_to<O: crate::color::RowOut>(out: &mut O, y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows: &SourceAxis, pixel: &PixelRgb) {
     let samples = luma.get(y);
-    let Some(ry) = rows.entries[y] else { return Vec::new() };
+    let Some(ry) = rows.entries[y] else { return };
     if pixel.monochrome() {
-        return samples.iter().map(|&s| pixel.rgb8(i32::from(s), 0.0, 0.0)).collect();
+        for &s in samples {
+            out.push(pixel.rgb8(i32::from(s), 0.0, 0.0));
+        }
+        return;
     }
     if let Some((lo0, phase, last)) = columns.halves {
         let (cb_row, cr_row) = (cb.get(ry.lo), cr.get(ry.lo));
@@ -1313,28 +1342,25 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
             let c = columns.lo.get(x).copied().unwrap_or(0);
             (at(cb_row, c) as f32, at(cr_row, c) as f32)
         };
-        let mut fused = Vec::with_capacity(samples.len());
         // With phase 1, pixel 0 has its chroma sample alone; pairs start at pixel 1.
         let head = phase.min(samples.len());
         for (x, &s) in samples.iter().enumerate().take(head) {
             let (c_b, c_r) = chroma(x);
-            fused.push(pixel.rgb8(i32::from(s), c_b, c_r));
+            out.push(pixel.rgb8(i32::from(s), c_b, c_r));
         }
         let c0 = lo0 + phase;
         let (cb_k, cr_k) = (cb_row.get(c0..=last).unwrap_or(&[]), cr_row.get(c0..=last).unwrap_or(&[]));
-        let done = head + pixel.row8_420_nearest(&mut fused, &samples[head..], cb_k, cr_k);
+        let done = head + pixel.row8_420_nearest(out, &samples[head..], cb_k, cr_k);
         for (x, &s) in samples.iter().enumerate().skip(done) {
             let (c_b, c_r) = chroma(x);
-            fused.push(pixel.rgb8(i32::from(s), c_b, c_r));
+            out.push(pixel.rgb8(i32::from(s), c_b, c_r));
         }
-        return fused;
+        return;
     }
     let pick = |row: &[u16]| -> Vec<f32> { columns.lo.iter().map(|&lo| at(row, lo) as f32).collect() };
     let (cb_row, cr_row) = (pick(cb.get(ry.lo)), pick(cr.get(ry.lo)));
     let luma_row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
-    let mut out = vec![[0u8; 3]; samples.len()];
-    pixel.row8(&mut out, &luma_row, &cb_row, &cr_row);
-    out
+    pixel.row8(out.next(samples.len()), &luma_row, &cb_row, &cr_row);
 }
 
 /// A chroma sample as `i32`, 0 past the row's end.

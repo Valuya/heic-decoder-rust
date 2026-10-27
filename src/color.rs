@@ -343,12 +343,66 @@ impl PixelRgb {
     }
 }
 
+/// Where a converted row goes: appended to a `Vec`, or written in place
+/// into an output row.
+pub(crate) trait RowOut {
+    fn push(&mut self, pixel: [u8; 3]);
+    fn push16(&mut self, block: &[[u8; 3]; 16]);
+    /// The next `n` pixels, to be written by the caller.
+    fn next(&mut self, n: usize) -> &mut [[u8; 3]];
+}
+
+impl RowOut for Vec<[u8; 3]> {
+    #[inline(always)]
+    fn push(&mut self, pixel: [u8; 3]) {
+        Vec::push(self, pixel);
+    }
+    #[inline(always)]
+    fn push16(&mut self, block: &[[u8; 3]; 16]) {
+        self.extend_from_slice(block);
+    }
+    fn next(&mut self, n: usize) -> &mut [[u8; 3]] {
+        let start = self.len();
+        self.resize(start + n, [0; 3]);
+        &mut self[start..]
+    }
+}
+
+/// An output row written in place, from its start.
+pub(crate) struct InPlace<'a> {
+    pub(crate) row: &'a mut [[u8; 3]],
+    pub(crate) at: usize,
+}
+
+impl RowOut for InPlace<'_> {
+    #[inline(always)]
+    fn push(&mut self, pixel: [u8; 3]) {
+        if let Some(d) = self.row.get_mut(self.at) {
+            *d = pixel;
+        }
+        self.at += 1;
+    }
+    #[inline(always)]
+    fn push16(&mut self, block: &[[u8; 3]; 16]) {
+        if let Some(d) = self.row.get_mut(self.at..self.at + 16) {
+            d.copy_from_slice(block);
+        }
+        self.at += 16;
+    }
+    fn next(&mut self, n: usize) -> &mut [[u8; 3]] {
+        let start = self.at.min(self.row.len());
+        self.at += n;
+        let end = self.at.min(self.row.len());
+        &mut self.row[start..end]
+    }
+}
+
 impl PixelRgb {
     /// A 4:2:0 row with nearest chroma straight from the samples: pixel `x`
     /// takes chroma sample `x / 2`. Appends whole blocks of 16 pixels to
     /// `out` with the AVX2 kernel and returns how many it did (0 without AVX2,
     /// for identity or monochrome); the caller converts the rest.
-    pub(crate) fn row8_420_nearest(&self, out: &mut Vec<[u8; 3]>, luma: &[u16], cb: &[u16], cr: &[u16]) -> usize {
+    pub(crate) fn row8_420_nearest<O: RowOut>(&self, out: &mut O, luma: &[u16], cb: &[u16], cr: &[u16]) -> usize {
         #[cfg(target_arch = "x86_64")]
         if !self.matrix.identity
             && !self.monochrome
@@ -362,17 +416,17 @@ impl PixelRgb {
 }
 
 #[cfg(target_arch = "x86_64")]
-struct Row420Avx2<'a> {
+struct Row420Avx2<'a, O> {
     simd: pulp::x86::V3,
     m: &'a Matrix,
-    out: &'a mut Vec<[u8; 3]>,
+    out: &'a mut O,
     luma: &'a [u16],
     cb: &'a [u16],
     cr: &'a [u16],
 }
 
 #[cfg(target_arch = "x86_64")]
-impl pulp::NullaryFnOnce for Row420Avx2<'_> {
+impl<O: RowOut> pulp::NullaryFnOnce for Row420Avx2<'_, O> {
     type Output = usize;
 
     #[inline(always)]
@@ -423,7 +477,7 @@ impl pulp::NullaryFnOnce for Row420Avx2<'_> {
                 interleave(simd, r, g, b, &masks, 1),
                 interleave(simd, r, g, b, &masks, 2),
             ]);
-            out.extend_from_slice(&block);
+            out.push16(&block);
             done += 16;
         }
         done
