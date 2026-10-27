@@ -1101,9 +1101,9 @@ struct Columns {
     lo: Vec<usize>,
     hi: Vec<usize>,
     weight: Vec<f32>,
-    /// `Some((lo[0], phase))` when column `x` reads chroma `lo[0] + (x + phase) / 2`
-    /// (4:2:0, nearest), `phase` 0 or 1.
-    halves: Option<(usize, usize)>,
+    /// `Some((lo[0], phase, last))` when column `x` reads chroma
+    /// `min(lo[0] + (x + phase) / 2, last)` (4:2:0, nearest), `phase` 0 or 1.
+    halves: Option<(usize, usize, usize)>,
 }
 
 impl Columns {
@@ -1113,7 +1113,7 @@ impl Columns {
         let halves = lo.first().copied().filter(|_| axis.entries.iter().all(Option::is_some)).and_then(|lo0| {
             // the last columns may be clamped to the last chroma sample
             let last = lo.iter().copied().max().unwrap_or(0);
-            (0..2).find(|&phase| lo.iter().enumerate().all(|(x, &l)| l == (lo0 + (x + phase) / 2).min(last))).map(|phase| (lo0, phase))
+            (0..2).find(|&phase| lo.iter().enumerate().all(|(x, &l)| l == (lo0 + (x + phase) / 2).min(last))).map(|phase| (lo0, phase, last))
         });
         Columns { lo, hi: get(|e| e.hi), weight: axis.entries.iter().map(|e| e.map_or(0.0, |e| e.weight)).collect(), halves }
     }
@@ -1241,7 +1241,7 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
         }
         return out;
     }
-    if let Some((lo0, phase)) = columns.halves
+    if let Some((lo0, phase, last)) = columns.halves
         && std::env::var("HEIC_NO_FUSED").as_deref() != Ok("1")
     {
         let (cb_row, cr_row) = (cb.get(ry.lo), cr.get(ry.lo));
@@ -1257,7 +1257,6 @@ fn flat_row(y: usize, luma: &Rows, cb: &Rows, cr: &Rows, columns: &Columns, rows
             fused.push(pixel.rgb8(i32::from(s), c_b, c_r));
         }
         let c0 = lo0 + phase;
-        let last = columns.lo.iter().copied().max().unwrap_or(0);
         let (cb_k, cr_k) = (cb_row.get(c0..=last).unwrap_or(&[]), cr_row.get(c0..=last).unwrap_or(&[]));
         let done = head + pixel.row8_420_nearest(&mut fused, &samples[head..], cb_k, cr_k);
         for (x, &s) in samples.iter().enumerate().skip(done) {
