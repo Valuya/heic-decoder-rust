@@ -14,7 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 4 {
         return Err("usage: reference_image <file.heic> <item-index> <out.hevc> [out.yuv]".into());
     }
-    let parsed = parse(&std::fs::read(&args[1])?)?;
+    let bytes = std::fs::read(&args[1])?;
+    let parsed = parse(&bytes)?;
     println!("grid={:?}, transforms={:?}, items={}", parsed.grid, parsed.transforms, parsed.images.len());
     let image = parsed.images.get(args[2].parse::<usize>()?).ok_or("item index out of range")?;
     let mut annexb = Vec::new();
