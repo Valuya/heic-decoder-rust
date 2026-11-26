@@ -26,6 +26,7 @@ timing = []
 [dependencies]
 thiserror = "2"
 rayon = "1.7"
+pulp = "0.22"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -37,10 +37,11 @@ struct Unfiltered<'a, T> {
 }
 
 impl<T: Sample> Unfiltered<'_, T> {
+    /// Row `y` of the copy, whole.
     #[inline(always)]
-    fn get(&self, x: usize, y: i64) -> Option<i32> {
+    fn row(&self, y: i64) -> Option<&[T]> {
         let row = usize::try_from(y - self.first).ok()?;
-        self.rows.get(row * self.width + x).map(|&s| s.into())
+        self.rows.get(row * self.width..(row + 1) * self.width)
     }
 }
 
@@ -65,16 +66,14 @@ fn apply_band<T: Sample>(
             *slot = o;
         }
     }
+    // Every sample of the CTB is written, offset 0 or not: no branch on the
+    // band, and row slices instead of a lookup per sample.
     for y in y0..y0 + h {
-        for x in x0..x0 + w {
-            let Some(sample) = src.get(x, y as i64) else { continue };
-            let band = (sample.clamp(0, max_val) >> band_shift) as usize;
-            let offset = band_table.get(band).copied().unwrap_or(0);
-            if offset != 0
-                && let Some(d) = dst.get_mut(y * width + x)
-            {
-                *d = T::narrow((sample + offset).clamp(0, max_val));
-            }
+        let (Some(row), Some(out)) = (src.row(y as i64).and_then(|r| r.get(x0..x0 + w)), dst.get_mut(y * width + x0..y * width + x0 + w)) else { continue };
+        for (d, &v) in out.iter_mut().zip(row) {
+            let sample: i32 = v.into();
+            let offset = band_table[(sample.clamp(0, max_val) >> band_shift) as usize & 31];
+            *d = T::narrow((sample + offset).clamp(0, max_val));
         }
     }
 }
@@ -100,26 +99,31 @@ fn apply_edge<T: Sample>(
     // == 2, i.e. sample on a local plateau) is never offset at all.
     let table: [i32; 5] = [offsets[0], offsets[1], 0, -offsets[2], -offsets[3]];
 
+    // The columns whose two neighbours are in the plane, once per CTB; then
+    // each row from three row slices, every sample written (an offset of 0
+    // writes the sample back), no branch on the edge class.
+    let lo = x0.max(usize::from(dx0 < 0 || dx1 < 0));
+    let hi = (x0 + w).min(width - usize::from(dx0 > 0 || dx1 > 0));
+    if lo >= hi {
+        return;
+    }
+    let sign = |a: i32, b: i32| i32::from(a > b) - i32::from(a < b);
     for y in y0..y0 + h {
         let (ny0, ny1) = (y as i64 + dy0 as i64, y as i64 + dy1 as i64);
         if ny0 < 0 || ny0 as usize >= height || ny1 < 0 || ny1 as usize >= height {
             continue;
         }
-        for x in x0..x0 + w {
-            let (nx0, nx1) = (x as i64 + dx0 as i64, x as i64 + dx1 as i64);
-            if nx0 < 0 || nx0 as usize >= width || nx1 < 0 || nx1 as usize >= width {
-                continue;
-            }
-            let Some(sample) = src.get(x, y as i64) else { continue };
-            let Some(n0) = src.get(nx0 as usize, ny0) else { continue };
-            let Some(n1) = src.get(nx1 as usize, ny1) else { continue };
-            let edge_idx = (2 + (sample - n0).signum() + (sample - n1).signum()) as usize;
-            let offset = table.get(edge_idx).copied().unwrap_or(0);
-            if offset != 0
-                && let Some(d) = dst.get_mut(y * width + x)
-            {
-                *d = T::narrow((sample + offset).clamp(0, max_val));
-            }
+        let (Some(row), Some(r0), Some(r1)) = (src.row(y as i64), src.row(ny0), src.row(ny1)) else { continue };
+        let n = hi - lo;
+        let (s0, s1) = ((lo as i64 + dx0 as i64) as usize, (lo as i64 + dx1 as i64) as usize);
+        let (Some(cur), Some(a), Some(b), Some(out)) = (row.get(lo..hi), r0.get(s0..s0 + n), r1.get(s1..s1 + n), dst.get_mut(y * width + lo..y * width + hi))
+        else {
+            continue;
+        };
+        for (((d, &v), &n0), &n1) in out.iter_mut().zip(cur).zip(a).zip(b) {
+            let (sample, n0, n1): (i32, i32, i32) = (v.into(), n0.into(), n1.into());
+            let offset = table[(2 + sign(sample, n0) + sign(sample, n1)) as usize];
+            *d = T::narrow((sample + offset).clamp(0, max_val));
         }
     }
 }

@@ -133,6 +133,54 @@ impl Border {
         Ok(Border { data: data_buf, nt })
     }
 
+    /// An all-zero border, to be filled by [`Border::fill`].
+    pub fn empty() -> Self {
+        Border { data: [0; MAX_BORDER], nt: 0 }
+    }
+
+    /// [`Border::build`] in place: `fetch_groups(data, avail)` writes the
+    /// available samples and marks them; this substitutes the rest. `false`
+    /// from it means it could not, and `fallback` builds the border instead.
+    pub fn fill(
+        &mut self,
+        nt: usize,
+        bit_depth: u32,
+        fetch_groups: impl FnOnce(&mut [i32], &mut [bool]) -> bool,
+        fallback: impl FnOnce() -> Result<Border>,
+    ) -> Result<()> {
+        let len = 4 * nt + 1;
+        if len > MAX_BORDER {
+            return Err(HeifError::MalformedHevc("intra border: block larger than 32x32"));
+        }
+        let mut avail_buf = [false; MAX_BORDER];
+        self.nt = nt;
+        let (data, avail) = (&mut self.data[..len], &mut avail_buf[..len]);
+        if !fetch_groups(data, avail) {
+            *self = fallback()?;
+            return Ok(());
+        }
+        match avail.iter().position(|&a| a) {
+            None => data.fill(1i32 << (bit_depth - 1)),
+            Some(first) => {
+                // Unavailable samples come in runs: each takes the sample before it
+                // (the first available one before any).
+                let mut last = data[first];
+                let mut k = 0;
+                while k < len {
+                    if avail[k] {
+                        last = data[k];
+                        k += 1;
+                    } else {
+                        let end = avail[k..].iter().position(|&a| a).map_or(len, |p| k + p);
+                        data[k..end].fill(last);
+                        k = end;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reference sample filtering (clause 8.4.4.2.3): the 1:2:1 smoothing
     /// filter, or the strong-intra-smoothing bilinear filter for a flat
     /// 32-wide luma block. No-op unless the mode/size combination calls
@@ -222,6 +270,17 @@ pub fn predict_planar(dst: &mut [i32], nt: usize, border: &Border) -> Result<()>
     let (left, top, top_right, bottom_left) = border.sides()?;
     let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_planar: index"))?;
     let n = nt as i32;
+    #[cfg(target_arch = "x86_64")]
+    if nt >= 8
+        && let Some(simd) = pulp::x86::V3::try_new()
+    {
+        let mut left_rows = [0i32; 32];
+        for (d, &l) in left_rows.iter_mut().zip(left) {
+            *d = l;
+        }
+        simd.vectorize(PlanarAvx2 { simd, dst, nt, left: &left_rows, top, top_right, bottom_left, shift: log2_nt + 1 });
+        return Ok(());
+    }
     for (y, (row, &left)) in dst.chunks_exact_mut(nt).zip(left).enumerate() {
         let y = y as i32;
         let fixed = (y + 1) * bottom_left + n;
@@ -305,8 +364,10 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
             }
         }
         let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))?;
-        for (y, row) in dst.chunks_exact_mut(nt).enumerate() {
-            project(row, reff, off, y, angle)?;
+        if !project_all(dst, nt, reff, off, angle, false) {
+            for (y, row) in dst.chunks_exact_mut(nt).enumerate() {
+                project(row, reff, off, y, angle)?;
+            }
         }
         if mode == 26 && cidx == 0 && nt < 32 && !disable_boundary_filter {
             for y in 0..nt {
@@ -336,13 +397,14 @@ pub fn predict_angular(dst: &mut [i32], nt: usize, cidx: usize, mode: u8, bit_de
         }
         // Columns of the prediction, each a row here, then transposed.
         let dst = dst.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("predict_angular: dst index"))?;
-        let mut columns = [0i32; 32 * 32];
-        for (x, column) in columns[..nt * nt].chunks_exact_mut(nt).enumerate() {
+        // One column at a time into a line, written straight down `dst`'s column.
+        let mut line = [0i32; 32];
+        let done = project_all(dst, nt, reff, off, angle, true);
+        for x in (0..nt).filter(|_| !done) {
+            let column = &mut line[..nt];
             project(column, reff, off, x, angle)?;
-        }
-        for (y, row) in dst.chunks_exact_mut(nt).enumerate() {
-            for (x, d) in row.iter_mut().enumerate() {
-                *d = columns[x * nt + y];
+            for (d, &v) in dst[x..].iter_mut().step_by(nt).zip(column.iter()) {
+                *d = v;
             }
         }
         if mode == 10 && cidx == 0 && nt < 32 && !disable_boundary_filter {
@@ -373,6 +435,136 @@ fn project(line: &mut [i32], reff: &[i32], off: i64, k: usize, angle: i32) -> Re
         line.copy_from_slice(reff.get(start..start + n).ok_or_else(err)?);
     }
     Ok(())
+}
+
+/// Planar prediction for `nt >= 8`, eight samples at a time: the scalar
+/// expression term by term in `i32` lanes.
+#[cfg(target_arch = "x86_64")]
+struct PlanarAvx2<'a> {
+    simd: pulp::x86::V3,
+    dst: &'a mut [i32],
+    nt: usize,
+    left: &'a [i32; 32],
+    top: &'a [i32],
+    top_right: i32,
+    bottom_left: i32,
+    shift: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for PlanarAvx2<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn call(self) {
+        use core::arch::x86_64::__m256i;
+        use pulp::bytemuck::cast;
+        let PlanarAvx2 { simd, dst, nt, left, top, top_right, bottom_left, shift } = self;
+        let (avx, avx2) = (simd.avx, simd.avx2);
+        let n = nt as i32;
+        let count = simd.sse2._mm_cvtsi32_si128(shift as i32);
+        let (tops, _) = top.as_chunks::<8>();
+        // per column chunk: (n - 1 - x) and (x + 1) * top_right
+        let mut w_left = [avx._mm256_setzero_si256(); 4];
+        let mut tr_term = [avx._mm256_setzero_si256(); 4];
+        for k in 0..nt / 8 {
+            let x0 = 8 * k as i32;
+            let xs = avx._mm256_setr_epi32(x0, x0 + 1, x0 + 2, x0 + 3, x0 + 4, x0 + 5, x0 + 6, x0 + 7);
+            w_left[k & 3] = avx2._mm256_sub_epi32(avx._mm256_set1_epi32(n - 1), xs);
+            tr_term[k & 3] = avx2._mm256_mullo_epi32(avx2._mm256_add_epi32(xs, avx._mm256_set1_epi32(1)), avx._mm256_set1_epi32(top_right));
+        }
+        for (y, row) in dst.chunks_exact_mut(nt).enumerate().take(nt) {
+            let yi = y as i32;
+            let fixed = avx._mm256_set1_epi32((yi + 1) * bottom_left + n);
+            let (l, a) = (avx._mm256_set1_epi32(left[y & 31]), avx._mm256_set1_epi32(n - 1 - yi));
+            let (out, _) = row.as_chunks_mut::<8>();
+            for (k, (o, t)) in out.iter_mut().zip(tops).enumerate() {
+                let top_v: __m256i = cast(*t);
+                let v = avx2._mm256_add_epi32(
+                    avx2._mm256_add_epi32(avx2._mm256_mullo_epi32(w_left[k & 3], l), tr_term[k & 3]),
+                    avx2._mm256_add_epi32(avx2._mm256_mullo_epi32(a, top_v), fixed),
+                );
+                *o = cast(avx2._mm256_sra_epi32(v, count));
+            }
+        }
+    }
+}
+
+/// Every line of an angular prediction (rows, or columns when `transposed`)
+/// with AVX2, for `nt >= 8`; `false` (nothing written) otherwise. The scalar
+/// `((32 - f) * a + f * b + 16) >> 5` as `(a << 5) + f * (b - a) + 16 >> 5`,
+/// the same integer.
+fn project_all(dst: &mut [i32], nt: usize, reff: &[i32], off: i64, angle: i32, transposed: bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if nt >= 8
+        && dst.len() >= nt * nt
+        && let Some(simd) = pulp::x86::V3::try_new()
+    {
+        return simd.vectorize(ProjectAvx2 { simd, dst, nt, reff, off, angle, transposed });
+    }
+    let _ = (dst, nt, reff, off, angle, transposed);
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+struct ProjectAvx2<'a> {
+    simd: pulp::x86::V3,
+    dst: &'a mut [i32],
+    nt: usize,
+    reff: &'a [i32],
+    off: i64,
+    angle: i32,
+    transposed: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl pulp::NullaryFnOnce for ProjectAvx2<'_> {
+    type Output = bool;
+
+    #[inline(always)]
+    fn call(self) -> bool {
+        use core::arch::x86_64::__m256i;
+        use pulp::bytemuck::cast;
+        let ProjectAvx2 { simd, dst, nt, reff, off, angle, transposed } = self;
+        let (avx, avx2) = (simd.avx, simd.avx2);
+        let sixteen = avx._mm256_set1_epi32(16);
+        // check every read first, so a bad index falls back before anything is written
+        for k in 0..nt {
+            let i_idx = ((k as i64 + 1) * i64::from(angle)) >> 5;
+            let Ok(start) = usize::try_from(i_idx + 1 + off) else { return false };
+            if start + nt + 1 > reff.len() {
+                return false;
+            }
+        }
+        let mut line = [0i32; 32];
+        for k in 0..nt {
+            let i_idx = ((k as i64 + 1) * i64::from(angle)) >> 5;
+            let f = (((k as i64 + 1) * i64::from(angle)) & 31) as i32;
+            let start = (i_idx + 1 + off) as usize;
+            let r = &reff[start..start + nt + 1];
+            let fv = avx._mm256_set1_epi32(f);
+            for (c, o) in line[..nt].as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let a: [i32; 8] = r[8 * c..8 * c + 8].try_into().unwrap_or([0; 8]);
+                let b: [i32; 8] = r[8 * c + 1..8 * c + 9].try_into().unwrap_or([0; 8]);
+                let (a, b): (__m256i, __m256i) = (cast(a), cast(b));
+                let v = if f == 0 {
+                    a
+                } else {
+                    let sum = avx2._mm256_add_epi32(avx2._mm256_slli_epi32::<5>(a), avx2._mm256_mullo_epi32(fv, avx2._mm256_sub_epi32(b, a)));
+                    avx2._mm256_srai_epi32::<5>(avx2._mm256_add_epi32(sum, sixteen))
+                };
+                *o = cast(v);
+            }
+            if transposed {
+                for (d, &v) in dst[k..].iter_mut().step_by(nt).zip(&line[..nt]) {
+                    *d = v;
+                }
+            } else {
+                dst[k * nt..k * nt + nt].copy_from_slice(&line[..nt]);
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]

@@ -88,7 +88,7 @@ impl Dequant {
 /// 64` for every valid `fact`. Smaller transforms read `MAT_DCT[fact*j][i]`
 /// with `fact = 32 / nT`.
 #[rustfmt::skip]
-const MAT_DCT: [[i32; 32]; 32] = [
+pub(crate) const MAT_DCT: [[i32; 32]; 32] = [
     [64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64],
     [90,90,88,85,82,78,73,67,61,54,46,38,31,22,13,4,-4,-13,-22,-31,-38,-46,-54,-61,-67,-73,-78,-82,-85,-88,-90,-90],
     [90,87,80,70,57,43,25,9,-9,-25,-43,-57,-70,-80,-87,-90,-90,-87,-80,-70,-57,-43,-25,-9,9,25,43,57,70,80,87,90],
@@ -238,6 +238,10 @@ pub fn inverse_transform_within(coeffs: &[i32], nt: usize, bit_depth: u32, use_d
         Some(shift) if shift >= 1 => shift,
         _ => return Err(HeifError::Unsupported("inverse_transform: bit depth too high")),
     };
+    #[cfg(target_arch = "x86_64")]
+    if !use_dst && super::transform_avx2::inverse_dct(coeffs, nt, bounds, bd_shift, out) {
+        return Ok(());
+    }
     let (columns, _) = transform_reads(nt, bounds);
     match (nt, use_dst, columns) {
         (4, true, _) => two_stage::<Dst4, 4, 4>(coeffs, bounds, bd_shift, out),
